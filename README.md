@@ -510,17 +510,41 @@ Isto é um **proxy local**. Quem tem acesso à porta tem acesso à sua sessão M
 
 ---
 
-## 📜 Licença / aviso
+## 📜 Licença
 
-Uso **pessoal / educacional**. Respeite os termos da Manus.  
-Profiles, cookies e vault são **seus dados** — não publique.
+**[ISC License](./LICENSE)** — permissiva (não é MIT).  
+Use, copie, modifique e distribua; mantenha o aviso de copyright.  
+O software é fornecido **“AS IS”**, sem garantias.
+
+Respeite também os **termos de uso da Manus**.  
+Profiles, cookies, vault e `.env` são **seus dados** — não publique.
+
+---
+
+## ⚠️ Disclaimer
+
+### Manutenção
+
+Este é um projeto **para estudo / uso pessoal**.  
+**AnThophicous** **não** se compromete a entregar atualizações semanais (nem em qualquer cadência fixa), **não** deve isso a ninguém, e **não** garante que o projeto continue ativo, mantido ou “no ar” para sempre.  
+Pode parar, mudar de rumo ou ser abandonado a qualquer momento, sem aviso.
+
+### Responsabilidade
+
+- Você usa **por sua conta e risco**.
+- O autor **não se responsabiliza** por banimento de conta, perda de créditos, vazamento de sessão, dados apagados, downtime, uso indevido, ou qualquer dano direto/indireto ligado a este software.
+- Não há garantia de funcionamento, segurança, compatibilidade com a API da Manus, nem de adequação a qualquer propósito.
+- Expor a proxy na rede sem `API_KEY` / firewall é risco **seu**.
+- Em caso de dúvida: leia o código, entenda o que roda na sua máquina, e decida sozinho se vale usar.
+
+**Resumo:** estudo open-source. Sem SLA. Sem suporte obrigatório. Sem garantia.
 
 ---
 
 <p align="center">
   <img src="https://media.imgcdn.org/repo/2025/11/manus-ai/692997d19ee82-manus-ai-Icon.webp" width="40" alt="" />
   <br/>
-  <sub>Manus Proxy v0.1.0 · OpenAI-compatible · local-first</sub>
+  <sub>Manus Proxy v0.1.0 · OpenAI-compatible · local-first · ISC</sub>
   <br/>
   <a href="https://github.com/AnThophicous/ManusProxy">github.com/AnThophicous/ManusProxy</a>
 </p>
