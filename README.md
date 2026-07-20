@@ -1,89 +1,295 @@
-# ManusProxy v0.2
+<p align="center">
+  <img src="https://framerusercontent.com/images/e0tzRu1UB7621gYXoDpV2jCjPuQ.png?width=800&height=600" alt="Manus Proxy banner" width="720" />
+</p>
 
-Proxy OpenAI-compatible para **Manus** com:
+<p align="center">
+  <img src="https://media.imgcdn.org/repo/2025/11/manus-ai/692997d19ee82-manus-ai-Icon.webp" alt="Manus icon" width="72" />
+</p>
 
-- SSE stream (`chat.completions` + `responses`)
-- Multi-conta + **vault criptografado** (AES-256-GCM)
-- `/v1/responses` com `previous_response_id` / `last_response_id` / `session_id`
-- **Reuso de sessão Manus** (não reenvia histórico → economiza tokens)
-- Imagens `data:image/...;base64,...`
-- Tool calls OpenAI-style
+<h1 align="center">Manus Proxy <sup>v0.1.0</sup></h1>
 
-Porta default: **3010**
+<p align="center">
+  <strong>Proxy local OpenAI-compatible</strong> para a Manus — chat, agent, stream SSE, tools e multi-conta.<br/>
+  Cole na OpenCode, Continue, Cursor, ou qualquer cliente que fale a API da OpenAI.
+</p>
+
+<p align="center">
+  <a href="#-no-ar-em-5-minutos">Quick start</a> ·
+  <a href="#-api">API</a> ·
+  <a href="#-como-funciona-visão-técnica">Arquitetura</a> ·
+  <a href="#-configuração">Config</a>
+</p>
 
 ---
 
-## Setup
+## O que é
+
+A Manus não expõe uma API OpenAI pública estável para o que a web faz.  
+**Manus Proxy** resolve isso no seu PC:
+
+1. Você faz login **uma vez** no Chrome (sticky profile + Turnstile humano)
+2. O proxy reutiliza a sessão (JWT) e fala com `api.manus.im` via Socket.IO
+3. Clientes usam `http://localhost:3010/v1/*` como se fosse OpenAI
+
+| Feature | Status |
+|--------|--------|
+| `POST /v1/chat/completions` | ✅ stream default-on |
+| `POST /v1/responses` + continuidade | ✅ `previous_response_id` / `session_id` |
+| Thinking / reasoning no SSE | ✅ `reasoning_content` (OpenCode-friendly) |
+| Multi-conta + vault AES-256-GCM | ✅ |
+| Workspace tools sandboxed | ✅ |
+| Imagens `data:image/...;base64` | ✅ |
+| Cancel de run / disconnect | ✅ stop no WS Manus |
+| Chrome headless por default | ✅ |
+
+---
+
+## ⚡ No ar em 5 minutos
+
+> Para quem só quer **usar**. Sem teoria.
+
+### Requisitos
+
+- **Node.js 20+**
+- **Google Chrome** instalado (recomendado)
+- Conta na [manus.im](https://manus.im)
+
+### 1. Clone e instale
 
 ```bash
+git clone https://github.com/AnThophicous/ManusProxy.git
 cd ManusProxy
 npm install
-copy .env.example .env
 ```
 
-Opcional no `.env`:
-
-```env
-MANUS_STORE_SECRET=uma-frase-longa-secreta
-API_KEY=
-PORT=3010
-BROWSER=chrome
-```
-
----
-
-## Login (multi-conta)
+### 2. Ambiente
 
 ```bash
-# conta default
-npm run login:chrome
+# Windows
+copy .env.example .env
 
-# segunda conta
-npm run login -- --account=trabalho --browser=chrome
+# macOS / Linux
+cp .env.example .env
 ```
 
-Profiles: `manus_profiles/<id>/`  
-Vault: `manus_profiles/accounts.vault.json` (criptografado)  
-Chave: `MANUS_STORE_SECRET` ou auto `manus_profiles/.store_key`
+Opcional no `.env` (pode deixar vazio no começo):
 
----
+```env
+PORT=3010
+API_KEY=
+BROWSER=chrome
+MANUS_HEADLESS=true
+MANUS_STORE_SECRET=troque-por-uma-frase-longa
+```
 
-## Subir
+### 3. Login (só na primeira vez)
+
+```bash
+npm run login:chrome
+```
+
+- Abre o Chrome **com UI**
+- Faça login na Manus (e-mail + Turnstile)
+- Quando o proxy detectar sessão válida, pode fechar
+
+Profile fica em `manus_profiles/default/`. **Não commite essa pasta.**
+
+### 4. Subir a proxy
 
 ```bash
 npm start
 ```
 
-| Route | Descrição |
-|-------|-----------|
-| `GET /health` | status, contas, features |
-| `GET /v1/models` | models |
-| `POST /v1/chat/completions` | chat (+ stream, tools, images, session_id) |
-| `POST /v1/responses` | Responses API |
-| `GET/DELETE /v1/responses/:id` | store |
-| `GET /v1/accounts` | multi-conta |
-| `POST /v1/accounts` | cria id |
-| `POST /v1/accounts/default` | set default |
+Você deve ver o bootstrap (logo Manus → checks → banner **MANUS PROXY**) e algo como:
 
-Header de conta: `x-manus-account: trabalho`
+```text
+http://localhost:3010
+```
+
+### 5. Teste rápido
+
+```bash
+curl http://localhost:3010/health
+```
+
+```bash
+curl http://localhost:3010/v1/chat/completions ^
+  -H "Content-Type: application/json" ^
+  -d "{\"model\":\"manus-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"oi\"}]}"
+```
+
+(macOS/Linux: troque `^` por `\`.)
+
+### 6. Plugue no seu cliente
+
+| Campo | Valor |
+|-------|--------|
+| Base URL | `http://localhost:3010/v1` |
+| API Key | o valor de `API_KEY` no `.env` (ou qualquer coisa se `API_KEY` estiver vazio) |
+| Model | `manus-chat` · `manus-agent` · `manus` · `manus-adaptive` |
+
+**OpenCode / OpenAI-compatible clients:** base URL apontando para `http://localhost:3010/v1`.
+
+Pronto. Se travou no login, rode `npm run login:chrome` de novo. Se a porta estiver ocupada, mude `PORT` no `.env`.
 
 ---
 
-## Responses API — economia de tokens
+## 🗺️ Mapa mental (Mermaid)
+
+### Fluxo do request (visão rápida)
+
+```mermaid
+flowchart LR
+  C[Cliente<br/>OpenCode / curl / app] -->|HTTP OpenAI-like| P[Manus Proxy<br/>:3010]
+  P -->|JWT sticky| B[Playwright Chrome<br/>profile]
+  P -->|Socket.IO| M[api.manus.im]
+  P -->|AES vault| V[(accounts.vault)]
+  P -->|sandbox| W[(./workspace)]
+  M -->|deltas text / thought / tools| P
+  P -->|SSE / JSON| C
+```
+
+### Pipeline interno de um chat
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant Hono as Hono /v1
+  participant Orch as Orchestrator
+  participant PW as Playwright session
+  participant WS as Manus Socket.IO
+  participant Tools as Workspace tools
+
+  Client->>Hono: POST /v1/chat/completions
+  Hono->>Hono: stream=true por default
+  Hono-->>Client: SSE open (first-byte cedo)
+  Hono->>Orch: run(messages, model, session?)
+  Orch->>PW: getManusAuth() JWT fresco
+  Orch->>WS: join_session? + user_message
+  loop deltas
+    WS-->>Orch: text / thought / tool_call
+    Orch-->>Client: reasoning_content / content deltas
+    opt tool builtin
+      Orch->>Tools: write_file / search_lines / …
+      Tools-->>Orch: result
+      Orch->>WS: tool result na sessão
+    end
+  end
+  Orch-->>Client: [DONE] / response final
+```
+
+### Estrutura de pastas (o que importa)
+
+```mermaid
+flowchart TB
+  subgraph repo [ManusProxy]
+    SRC[src/]
+    WS_DIR[workspace/]
+    PROF[manus_profiles/]
+    ENV[.env]
+  end
+
+  subgraph src_tree [src]
+    IDX[index.ts — bootstrap + serve]
+    APP[app.ts — rotas Hono]
+    R[routes/]
+    M[manus/ — client + ws + models]
+    O[openai/ — sse, tools, thinking]
+    A[account/ — vault AES + rotator]
+    T[tools/builtin.ts — sandbox]
+    S[services/playwright.ts]
+    CLI[cli/ — TUI bootstrap]
+  end
+
+  SRC --> src_tree
+  IDX --> APP
+  APP --> R
+  R --> O
+  R --> M
+  M --> S
+  A --> PROF
+  T --> WS_DIR
+```
+
+---
+
+## 📡 API
+
+Base: `http://localhost:3010`
+
+| Método | Rota | O que faz |
+|--------|------|-----------|
+| `GET` | `/health` | status, contas, features |
+| `GET` | `/v1/models` | lista de models |
+| `GET` | `/v1/models/:id` | model único |
+| `POST` | `/v1/chat/completions` | chat OpenAI-like (SSE default) |
+| `POST` | `/v1/responses` | Responses API + continuidade |
+| `GET` | `/v1/responses/:id` | busca response no store |
+| `DELETE` | `/v1/responses/:id` | apaga (e cancela se ativo) |
+| `POST` | `/v1/responses/:id/cancel` | cancela run |
+| `GET` | `/v1/runs/active` | gerações em voo |
+| `GET` | `/v1/accounts` | lista contas |
+| `POST` | `/v1/accounts` | cria id de conta |
+| `POST` | `/v1/accounts/default` | define default |
+| `DELETE` | `/v1/accounts/:id` | remove conta |
+
+### Models
+
+| id | uso |
+|----|-----|
+| `manus` / `manus-chat` | chat |
+| `manus-agent` | modo agent |
+| `manus-adaptive` | adaptive |
+
+### Headers úteis
+
+| Header | Quando |
+|--------|--------|
+| `Authorization: Bearer <API_KEY>` | se `API_KEY` estiver no `.env` |
+| `x-manus-account: <id>` | escolher conta (senão usa default) |
+
+### Stream
+
+Por default **streama**. Só desliga se mandar `"stream": false`.
+
+Thinking da Manus aparece como:
 
 ```json
-// 1) primeira mensagem
+{
+  "choices": [{
+    "delta": {
+      "reasoning_content": "…pensamento…"
+    }
+  }]
+}
+```
+
+Controle via `MANUS_THINK_MODE` (`reasoning_content` | `both` | `content_tags` | `off`).
+
+---
+
+## 🧵 Continuidade de sessão (economia de tokens)
+
+A Manus tem sessão real (`join_session`). O proxy **não reenvia o histórico inteiro** no follow-up.
+
+### Responses API
+
+```http
 POST /v1/responses
+Content-Type: application/json
+```
+
+```json
 {
   "model": "manus-chat",
   "input": "Lembre que meu nome é Elaine",
   "session_id": "conv-1"
 }
+```
 
-// → response.id = resp_xxx, session_id, Manus session interna
+Depois:
 
-// 2) follow-up — SÓ o turno novo vai pro Manus (join_session)
-POST /v1/responses
+```json
 {
   "model": "manus-chat",
   "input": "Qual é meu nome?",
@@ -93,49 +299,175 @@ POST /v1/responses
 
 Aliases: `last_response_id` ≡ `previous_response_id`.
 
-Também funciona em chat:
+### Chat completions
 
 ```json
 {
   "model": "manus-chat",
-  "session_id": "<manus_session_from_previous>",
+  "session_id": "<session_da_resposta_anterior>",
   "messages": [{ "role": "user", "content": "continua" }]
 }
 ```
 
 ---
 
-## Stream SSE
+## 🧰 Tools (workspace)
 
-```json
-{ "model": "manus-chat", "stream": true, "messages": [...] }
-```
+Tools builtin rodam **no seu PC**, sandboxed em `./workspace` (ou `MANUS_WORKSPACE=`).
 
-### Thinking / reasoning da Manus
+| Tool | Função |
+|------|--------|
+| `workspace` | root + árvore |
+| `write_file` | criar/escrever |
+| `read_file` | ler |
+| `list_dir` | listar |
+| `mkdir` | pasta |
+| `delete_path` | apagar |
+| `move_path` | mover/renomear |
+| `replace_in_file` | replace pontual |
+| `search_files` | achar por nome |
+| `search_lines` | grep com nº de linha |
+| `file_info` | meta do arquivo |
+| `manual_fetch` | HTTP fetch simples |
 
-Capturado de `chatDelta.delta.thought` (e aliases) e exposto no stream:
-
-**Chat Completions SSE**
-```json
-{
-  "choices": [{
-    "delta": {
-      "reasoning_content": "…pensamento…",
-      "reasoning": "…pensamento…"
-    }
-  }]
-}
-```
-No final (non-stream): `message.reasoning_content` + `message.reasoning`.
-
-**Responses SSE**
-- `response.reasoning_summary_text.delta`
-- `manus.thinking.delta` (alias)
-- item `type: "reasoning"` no `output` final
+Cliente também pode mandar `tools` no formato OpenAI; o proxy instrui a Manus a emitir `<tool_call>…</tool_call>`.
 
 ---
 
-## Imagens (data URL)
+## 🔐 Multi-conta
+
+```bash
+# conta default
+npm run login:chrome
+
+# outra conta
+npm run login -- --account=trabalho --browser=chrome
+```
+
+- Profiles: `manus_profiles/<id>/`
+- Vault: `manus_profiles/accounts.vault.json` (AES-256-GCM)
+- Chave: `MANUS_STORE_SECRET` ou auto `manus_profiles/.store_key`
+
+Rotação por créditos quando há várias contas no pool.
+
+**Nunca suba no Git:** `manus_profiles/`, `.store_key`, `*.vault.json`, `.env`.
+
+---
+
+## ⚙️ Configuração
+
+| Variável | Default | Descrição |
+|----------|---------|-----------|
+| `PORT` | `3010` | porta HTTP |
+| `API_KEY` | vazio | se setado, exige Bearer |
+| `BROWSER` | `chrome` | `chrome` / `chromium` / `edge` / `firefox` |
+| `MANUS_HEADLESS` | `true` | UI só no login / `--headed` |
+| `MANUS_ACCOUNT` | `default` | conta default |
+| `MANUS_WORKSPACE` | `./workspace` | root das tools |
+| `MANUS_STORE_SECRET` | auto keyfile | segredo do vault |
+| `MANUS_THINK_MODE` | `reasoning_content` | como expõe thinking |
+| `MANUS_WS_DEBUG` | `false` | frames Socket.IO no log |
+
+Scripts úteis:
+
+```bash
+npm start                 # headless chrome
+npm run start:headed      # com UI do browser
+npm run login:chrome      # login interativo
+npm run session           # checa sessão
+npm run test:chat         # smoke chat
+```
+
+---
+
+## 🧠 Como funciona (visão técnica)
+
+### Ideia central
+
+```text
+Cliente OpenAI-like
+        │
+        ▼
+   Hono (src/app.ts)
+        │
+        ├─ routes/chat.ts / responses.ts
+        │       │
+        │       ▼
+        │  orchestrator/run.ts
+        │       │
+        │       ├─ account vault + rotator
+        │       ├─ response-store (previous_response_id → session Manus)
+        │       ├─ tools/builtin.ts (sandbox)
+        │       └─ manus/*
+        │              ├─ client.ts  (HTTP api.manus.im)
+        │              └─ ws.ts      (Socket.IO chat deltas)
+        │
+        └─ services/playwright.ts
+                 sticky profile → cookies/JWT frescos
+```
+
+### Camadas
+
+| Camada | Pasta | Papel |
+|--------|-------|-------|
+| Bootstrap / TUI | `src/cli/` | ASCII logo, warm checks, banner, logs append-only |
+| HTTP surface | `src/routes/`, `app.ts` | contrato OpenAI |
+| Orquestração | `src/orchestrator/` | lifecycle do run, tools loop, cancel |
+| Manus protocol | `src/manus/` | auth user info, WS, autonomy, models |
+| OpenAI shaping | `src/openai/` | SSE, thinking stream, tool parse, errors |
+| Contas | `src/account/` | crypto AES-GCM, store, pool, rotator |
+| Browser | `src/services/playwright.ts` | profile isolado por conta |
+| Tools | `src/tools/builtin.ts` | FS sandbox + fetch |
+
+### Autenticação Manus
+
+1. Playwright abre (ou reusa) profile em `manus_profiles/<account>/`
+2. Navega `manus.im` — se não logado, fluxo de login humano (Turnstile)
+3. Extrai tokens/cookies da sessão web
+4. Proxy usa JWT nas chamadas `api.manus.im` e no handshake Socket.IO
+5. Chat real roda no WS: `join_session` (continuidade) + `user_message`
+
+### Por que sticky profile?
+
+JWT da Manus expira / depende de sessão browser. Profile Playwright evita login a cada request e mantém o mesmo “browser fingerprinted” da conta.
+
+### Stream e first-byte
+
+O proxy **abre o SSE cedo** (antes de autenticar/esperar o modelo), para clientes sensíveis a TTFB (OpenCode, etc.) não caírem em timeout. Comentários SSE de progresso podem aparecer enquanto o browser aquece.
+
+### Autonomy
+
+Em modo agent, o proxy injeta diretriz para a Manus **não ficar parada esperando o usuário** quando a tarefa pode avançar sozinha. Quando a Manus **realmente** pede input humano (HITL):
+
+| API | Sinal |
+|-----|--------|
+| `/v1/responses` | `status: "incomplete"`, `reason: "awaiting_user_input"` |
+| stream | `manus.requires_input` |
+| chat | `requires_action: true` |
+
+Continue com a **mesma** `previous_response_id` / `session_id`.
+
+### Cancel
+
+- Cliente aborta SSE → proxy manda `stop` no WS Manus
+- `POST /v1/responses/:id/cancel` → idem
+- `GET /v1/runs/active` lista o que está voando
+
+### Segurança (local)
+
+| Item | Como |
+|------|------|
+| Metadata de contas | AES-256-GCM |
+| Response store em disco | AES-256-GCM |
+| Profiles de browser | isolados por conta |
+| Paths de tools | não saem do workspace |
+| Logs | JWT redacted; e-mail mascarado na API |
+
+Isto é um **proxy local**. Quem tem acesso à porta tem acesso à sua sessão Manus. Use `API_KEY` e firewall se for expor na rede.
+
+---
+
+## 🖼️ Imagens
 
 ```json
 {
@@ -144,7 +476,10 @@ No final (non-stream): `message.reasoning_content` + `message.reasoning`.
     "role": "user",
     "content": [
       { "type": "text", "text": "O que tem na imagem?" },
-      { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBOR..." } }
+      {
+        "type": "image_url",
+        "image_url": { "url": "data:image/png;base64,iVBOR..." }
+      }
     ]
   }]
 }
@@ -152,94 +487,40 @@ No final (non-stream): `message.reasoning_content` + `message.reasoning`.
 
 ---
 
-## Tool calls
+## ❗ Problemas comuns
 
-Envie `tools` no formato OpenAI. O proxy instrui a Manus a emitir:
-
-```xml
-<tool_call>
-{"name":"get_weather","arguments":{"city":"SP"}}
-</tool_call>
-```
-
-Resposta volta com `finish_reason: "tool_calls"` e `message.tool_calls[]`.  
-Mande de volta `role: "tool"` + `tool_call_id` **na mesma session** (`previous_response_id` ou `session_id`).
+| Sintoma | O que tentar |
+|---------|----------------|
+| Não loga / sessão inválida | `npm run login:chrome` de novo |
+| Porta em uso | mude `PORT` ou mate o processo na 3010 |
+| Profile lock / Playwright estranho | feche outras instâncias do proxy; um process por profile |
+| Cliente não streama thinking | confira `MANUS_THINK_MODE=reasoning_content` |
+| Tools escrevem “fora” | paths relativos ao `workspace/` |
+| 401 nas rotas `/v1` | `API_KEY` setado → mande `Authorization: Bearer …` |
 
 ---
 
-## Aguardando resposta humana (HITL)
+## 📦 Stack
 
-Quando o agente Manus **pausa e espera você** (confirmar, escolher, digitar):
-
-| API | Sinal |
-|-----|--------|
-| `/v1/responses` | `status: "incomplete"`, `incomplete_details.reason: "awaiting_user_input"` |
-| stream | evento `manus.requires_input` + depois `response.incomplete` |
-| chat | `requires_action: true` + `requires_action_detail` |
-
-**Como continuar:** mande a resposta do usuário na **mesma cadeia**:
-
-```json
-POST /v1/responses
-{
-  "model": "manus-agent",
-  "previous_response_id": "resp_xxx",
-  "input": "Sim, pode seguir com a opção 2"
-}
-```
-
-A sessão Manus é reaberta com `join_session` — sem reenviar o histórico inteiro.
+- **Runtime:** Node + TypeScript (`tsx`)
+- **HTTP:** [Hono](https://hono.dev)
+- **Browser:** Playwright (`channel: chrome` por default)
+- **Realtime:** `socket.io-client` → `wss://api.manus.im`
+- **Crypto:** AES-256-GCM (vault + store)
 
 ---
 
-## Cancelar stream / run
+## 📜 Licença / aviso
 
-### 1) Cliente fecha a conexão (AbortController / fechar SSE)
-- Proxy detecta `onAbort`
-- Emite `stop` no WebSocket Manus
-- Encerra com `cancelled` (não 500)
-
-### 2) Cancel explícito por id
-
-```bash
-# enquanto o stream roda, o id é resp_… ou chatcmpl-…
-curl.exe -X POST http://localhost:3010/v1/responses/resp_XXX/cancel
-```
-
-```bash
-GET /v1/runs/active   # lista gerações em voo
-```
-
-| Ação | Efeito |
-|------|--------|
-| `POST …/cancel` | abort local + stop Manus |
-| disconnect SSE | idem |
-| `DELETE /v1/responses/:id` | cancela se ativo + apaga store |
+Uso **pessoal / educacional**. Respeite os termos da Manus.  
+Profiles, cookies e vault são **seus dados** — não publique.
 
 ---
 
-## Segurança
-
-| Item | Como |
-|------|------|
-| Metadata de contas | AES-256-GCM vault |
-| Response store disk | AES-256-GCM |
-| Browser profiles | isolados por conta |
-| Logs | JWT redacted; e-mail mascarado na API |
-
-**Não commite** `manus_profiles/`, `.store_key`, `*.vault.json`.
-
----
-
-## Arquitetura
-
-```
-Cliente ──► Hono /v1/*
-              │
-              ├─ account vault (AES)
-              ├─ response store (session continuity)
-              ├─ Playwright profile (JWT fresco)
-              └─ Socket.IO wss://api.manus.im
-                   join_session? + user_message
-                   (text / image / tools)
-```
+<p align="center">
+  <img src="https://media.imgcdn.org/repo/2025/11/manus-ai/692997d19ee82-manus-ai-Icon.webp" width="40" alt="" />
+  <br/>
+  <sub>Manus Proxy v0.1.0 · OpenAI-compatible · local-first</sub>
+  <br/>
+  <a href="https://github.com/AnThophicous/ManusProxy">github.com/AnThophicous/ManusProxy</a>
+</p>
