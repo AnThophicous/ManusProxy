@@ -1,0 +1,41 @@
+{
+  "name": "manusproxy",
+  "version": "0.3.0",
+  "description": "OpenAI-compatible Manus proxy via Playwright session + api.manus.im",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "npx tsx src/index.ts",
+    "start:chrome": "npx tsx src/index.ts --browser=chrome",
+    "start:edge": "npx tsx src/index.ts --browser=edge",
+    "start:headed": "npx tsx src/index.ts --browser=chrome --headed",
+    "login": "npx tsx src/login.ts",
+    "login:chrome": "npx tsx src/login.ts --browser=chrome",
+    "capture": "npx tsx src/capture.ts",
+    "session": "npx tsx src/session-check.ts",
+    "test:chat": "npx tsx src/test-chat.ts"
+  },
+  "keywords": [
+    "manus",
+    "proxy",
+    "openai",
+    "playwright"
+  ],
+  "author": "Elaine",
+  "license": "ISC",
+  "dependencies": {
+    "@hono/node-server": "^2.0.2",
+    "dotenv": "^17.4.2",
+    "hono": "^4.12.18",
+    "nanoid": "^6.0.0",
+    "playwright": "^1.59.1",
+    "socket.io-client": "^4.8.3",
+    "uuid": "^14.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.2",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

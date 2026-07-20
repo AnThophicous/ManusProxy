@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.env
+manus_profile/
+manus_profiles/
+!manus_profiles/.gitkeep
+capture/
+workspace/
+!workspace/.gitkeep
+*.log
+.playwright-mcp/
+tmp-*.json
+tmp-req.json
+*.vault.json
+*.vault.json.tmp
+.store_key
+**/ .store_key
+manus_profiles/.store_key
+*.pma
