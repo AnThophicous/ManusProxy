@@ -96,10 +96,41 @@ export async function ensureAccountWithCredits(
     return { accountId: start, credits, rotated: false };
   }
   log.warn('ROTATE', start, 'credits exhausted, rotating…', credits);
+  // Mark current so we don't bounce back immediately
+  upsertAccount(start, {
+    notes: `exhausted@${new Date().toISOString()} total=${credits.total}`,
+  });
   const next = await rotateAccount(start);
   if (!next) {
     return { accountId: start, credits, rotated: false };
   }
   credits = await readCredits(next);
   return { accountId: next, credits, rotated: true };
+}
+
+/** Mark account as out of credits (after Manus says so mid-request). */
+export function markAccountCreditsExhausted(
+  accountId: string,
+  detail?: string
+): void {
+  const id = resolveAccountId(accountId);
+  upsertAccount(id, {
+    notes: `exhausted@${new Date().toISOString()}${detail ? ' ' + detail : ''}`,
+  });
+  log.warn('ROTATE', id, 'marked exhausted', { detail });
+}
+
+/**
+ * After Manus returns credits_exhausted, pick another logged-in account.
+ * Returns null if none left with credits.
+ */
+export async function switchAccountOnCreditsExhausted(
+  fromAccountId: string
+): Promise<{ accountId: string; credits: CreditsSnapshot } | null> {
+  markAccountCreditsExhausted(fromAccountId, 'manus_said_no_credits');
+  const next = await rotateAccount(fromAccountId);
+  if (!next) return null;
+  const credits = await readCredits(next);
+  if (creditsExhausted(credits)) return null;
+  return { accountId: next, credits };
 }

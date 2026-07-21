@@ -3,12 +3,18 @@ import { getUserInfo } from '../manus/client.ts';
 import { sendManusChat, type ManusChatResult } from '../manus/ws.ts';
 import { withAutonomy } from '../manus/autonomy.ts';
 import { getPreferredAccount } from '../account/pool.ts';
-import { storeEncryptedAuth, markAccountReady } from '../account/store.ts';
+import {
+  storeEncryptedAuth,
+  markAccountReady,
+  setDefaultAccountId,
+} from '../account/store.ts';
 import {
   ensureAccountWithCredits,
   rotateAccount,
   creditsExhausted,
   readCredits,
+  switchAccountOnCreditsExhausted,
+  markAccountCreditsExhausted,
 } from '../account/rotator.ts';
 import { responseStore } from '../store/response-store.ts';
 import {
@@ -180,11 +186,16 @@ function resolveContinuity(
   };
 }
 
+function isCreditsDead(result: ManusChatResult): boolean {
+  return Boolean(result.creditsExhausted || result.status === 'credits_exhausted');
+}
+
 function assertCreditsOk(result: ManusChatResult): void {
-  if (result.creditsExhausted || result.status === 'credits_exhausted') {
+  if (isCreditsDead(result)) {
     throw new Error(
       stripHostNudgeFrom(result.content) ||
-        'Créditos da Manus esgotados nesta conta. Espere o refresh diário, troque de conta (x-manus-account) ou faça upgrade no manus.im.'
+        'Créditos da Manus esgotados em todas as contas disponíveis. ' +
+          'Espere o refresh diário, faça login em outra (npm run login -- --account=nome) ou upgrade no manus.im.'
     );
   }
 }
@@ -194,6 +205,99 @@ function stripHostNudgeFrom(text: string): string {
     .replace(/\[HOST[^\]]*\][^\n]*/gi, '')
     .replace(/Continue with <tool_call>[\s\S]*?No narration\.[^\n]*/gi, '')
     .trim();
+}
+
+/**
+ * Run Manus turn; if the account is out of credits, switch account and retry
+ * on a fresh Manus session (cannot join_session across accounts).
+ */
+async function runWithToolLoopCreditRotate(
+  opts: Parameters<typeof runWithToolLoop>[0]
+): Promise<ManusChatResult & { accountId: string; rotatedFrom?: string }> {
+  const maxAccountSwitches = 6;
+  let accountId = opts.accountId;
+  let sessionId = opts.sessionId;
+  let lastEventId = opts.lastEventId;
+  let rotatedFrom: string | undefined;
+  let result = await runWithToolLoop({
+    ...opts,
+    accountId,
+    sessionId,
+    lastEventId,
+  });
+
+  let switches = 0;
+  while (isCreditsDead(result) && switches < maxAccountSwitches) {
+    switches += 1;
+    markAccountCreditsExhausted(accountId, 'mid_request');
+    log.warn(
+      'ROTATE',
+      accountId,
+      `sem créditos mid-request — trocando conta (tentativa ${switches})`
+    );
+
+    const next = await switchAccountOnCreditsExhausted(accountId);
+    if (!next) {
+      log.err('ROTATE', 'fail', 'nenhuma outra conta com créditos');
+      break;
+    }
+
+    // Auth the new profile (warm JWT)
+    try {
+      await ensureAuth(next.accountId);
+    } catch (e) {
+      log.warn(
+        'ROTATE',
+        next.accountId,
+        e instanceof Error ? e.message : String(e)
+      );
+      // try next loop
+      accountId = next.accountId;
+      continue;
+    }
+
+    rotatedFrom = rotatedFrom || opts.accountId;
+    accountId = next.accountId;
+    // New account = new Manus session (do not join dead account's session)
+    sessionId = null;
+    lastEventId = null;
+
+    log.ok(
+      'ROTATE',
+      accountId,
+      `retry com conta nova · credits=${next.credits.total}`
+    );
+
+    try {
+      setDefaultAccountId(accountId);
+    } catch {
+      /* ignore */
+    }
+
+    // Optional SSE comment for OpenCode (if handlers present)
+    try {
+      await opts.handlers?.onAgentEvent?.({
+        type: 'statusUpdate',
+        brief: `Trocando para conta ${accountId} (créditos esgotados na anterior)`,
+        agentStatus: 'rotating',
+      });
+      // Keepalive progress so client sees rotation instead of freeze
+      await opts.handlers?.onThought?.(
+        `\n[ManusProxy] Conta sem créditos — trocando para \`${accountId}\`…\n`
+      );
+    } catch {
+      /* ignore */
+    }
+
+    result = await runWithToolLoop({
+      ...opts,
+      accountId,
+      sessionId,
+      lastEventId,
+    });
+  }
+
+  return { ...result, accountId, rotatedFrom };
 }
 
 async function ensureAuth(accountId: string): Promise<{ accountId: string; rotated: boolean }> {
@@ -207,15 +311,37 @@ async function ensureAuth(accountId: string): Promise<{ accountId: string; rotat
     rotated = pick.rotated;
     if (pick.rotated) {
       log.ok('ROTATE', id, `using account with credits=${pick.credits.total}`);
+      try {
+        setDefaultAccountId(id);
+      } catch {
+        /* ignore */
+      }
     }
     if (creditsExhausted(pick.credits)) {
-      // double-check live
+      // double-check live — may still recover after rotate
       const live = await readCredits(id);
       if (creditsExhausted(live)) {
-        throw new Error(
-          `Créditos da Manus esgotados (conta=${id}, total=${live.total}). ` +
-            `Refresh diário ou faça login em outra conta: npm run login -- --account=outra`
-        );
+        // One more full rotation pass
+        const again = await rotateAccount(id);
+        if (again) {
+          id = again;
+          rotated = true;
+          const c2 = await readCredits(id);
+          if (!creditsExhausted(c2)) {
+            setDefaultAccountId(id);
+            log.ok('ROTATE', id, `segunda chance · credits=${c2.total}`);
+          } else {
+            throw new Error(
+              `Créditos da Manus esgotados em todas as contas (última=${id}, total=${c2.total}). ` +
+                `Login: npm run login -- --account=nova`
+            );
+          }
+        } else {
+          throw new Error(
+            `Créditos da Manus esgotados (conta=${id}, total=${live.total}). ` +
+              `Nenhuma outra conta pronta. Login: npm run login -- --account=outra`
+          );
+        }
       }
     }
   } catch (e) {
@@ -502,9 +628,9 @@ export async function runChatCompletionNonStream(
     stopManus: () => stopManus?.(),
   });
 
-  let result: ManusChatResult;
+  let result: ManusChatResult & { accountId?: string; rotatedFrom?: string };
   try {
-    result = await runWithToolLoop({
+    result = await runWithToolLoopCreditRotate({
       prompt,
       model: body.model,
       accountId: continuity.accountId,
@@ -518,6 +644,7 @@ export async function runChatCompletionNonStream(
         stopManus = ctl.stop;
       },
     });
+    if (result.accountId) continuity.accountId = result.accountId;
   } finally {
     unregisterRun(id);
   }
@@ -703,9 +830,9 @@ export async function runChatCompletionStream(
     });
   };
 
-  let result: ManusChatResult;
+  let result: ManusChatResult & { accountId?: string };
   try {
-    result = await runWithToolLoop({
+    result = await runWithToolLoopCreditRotate({
       prompt,
       model: body.model,
       accountId: continuity.accountId,
@@ -827,11 +954,13 @@ export async function runChatCompletionStream(
     unregisterRun(id);
   }
 
-  // Credits gone mid-stream: emit clean error instead of more nudges
+  if (result.accountId) continuity.accountId = result.accountId;
+
+  // Credits gone on ALL accounts after rotation: clean error for OpenCode
   if (result.creditsExhausted || result.status === 'credits_exhausted') {
     const msg =
       stripHostNudgeFrom(result.content) ||
-      'Créditos da Manus esgotados. Espere o refresh diário ou troque de conta.';
+      'Créditos da Manus esgotados em todas as contas. Faça login em outra ou espere o refresh.';
     await writer.writeError(msg, 'insufficient_quota', 'insufficient_quota');
     await writer.writeDone();
     return;
@@ -999,9 +1128,9 @@ export async function runResponsesNonStream(
     stopManus: () => stopManus?.(),
   });
 
-  let result: ManusChatResult;
+  let result: ManusChatResult & { accountId?: string };
   try {
-    result = await runWithToolLoop({
+    result = await runWithToolLoopCreditRotate({
       prompt,
       model: body.model,
       accountId: continuity.accountId,
@@ -1015,9 +1144,12 @@ export async function runResponsesNonStream(
         stopManus = ctl.stop;
       },
     });
+    if (result.accountId) continuity.accountId = result.accountId;
   } finally {
     unregisterRun(responseId);
   }
+
+  assertCreditsOk(result);
 
   const { cleanText, toolCalls } = parseToolCallsFromText(result.content);
   const reasoning = result.reasoning || '';
@@ -1151,9 +1283,9 @@ export async function runResponsesStream(
   });
 
   let assembled = '';
-  let result: ManusChatResult;
+  let result: ManusChatResult & { accountId?: string };
   try {
-    result = await runWithToolLoop({
+    result = await runWithToolLoopCreditRotate({
       prompt,
       model: body.model,
       accountId: continuity.accountId,

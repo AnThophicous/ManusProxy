@@ -992,9 +992,11 @@ export async function sendManusChat(opts: {
       if (net) {
         sawAssistantChat = true;
         markActivity('text');
-        // Credits dead → stream the Manus message once then finish (no more nudges)
+        // Credits dead → do NOT stream quota spam to OpenCode; proxy will rotate account
         if (detectCreditsExhausted(content) || detectCreditsExhausted(net)) {
-          await opts.handlers?.onDelta?.(net);
+          console.log(
+            `[manus-ws] credits message (not streamed to client) session=${sessionId}: ${net.slice(0, 80)}`
+          );
           markCreditsExhausted('assistant_text');
           return;
         }
