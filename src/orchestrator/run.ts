@@ -19,11 +19,17 @@ import {
   type ResponseObject,
 } from '../openai/types.ts';
 import type { SseWriter } from '../openai/sse.ts';
-import { parseToolCallsFromText, toolsToSystemPrompt, toolCallsToSseDeltas } from '../openai/tools.ts';
+import {
+  parseToolCallsFromText,
+  toolsToSystemPrompt,
+  toolCallsToSseDeltas,
+  looksLikeManusSandboxPath,
+} from '../openai/tools.ts';
 import {
   executeBuiltinTool,
   isBuiltinTool,
   mergeTools,
+  builtinsEnabled,
 } from '../tools/builtin.ts';
 import { log } from '../cli/log-bus.ts';
 import { ThinkingStreamBridge, stripThinkTags } from '../openai/thinking-stream.ts';
@@ -53,6 +59,14 @@ type Continuity = {
   clientSessionId: string | null;
   /** When true, only send latest turn (server already has context) */
   reuseSession: boolean;
+};
+
+type ToolsBundle = {
+  tools: OpenAITool[];
+  prompt: string;
+  hasClientTools: boolean;
+  hasBuiltinTools: boolean;
+  hasHostTools: boolean;
 };
 
 /** Manus shortUIDs are ~22 url-safe alphanumerics */
@@ -221,6 +235,7 @@ async function runWithToolLoop(opts: {
   lastEventId: string | null;
   images: Array<{ dataUrl: string; mime: string }>;
   tools: OpenAITool[];
+  hasHostTools?: boolean;
   signal?: AbortSignal;
   onReady?: (ctl: { stop: () => void; sessionId: string }) => void;
   handlers?: Parameters<typeof sendManusChat>[0]['handlers'];
@@ -231,6 +246,7 @@ async function runWithToolLoop(opts: {
   let sessionId = opts.sessionId;
   let lastEventId = opts.lastEventId;
   let last: ManusChatResult | null = null;
+  const hasHostTools = opts.hasHostTools ?? opts.tools.length > 0;
 
   for (let round = 0; round < maxRounds; round++) {
     last = await sendManusChat({
@@ -240,6 +256,8 @@ async function runWithToolLoop(opts: {
       sessionId,
       lastEventId,
       images: round === 0 ? opts.images : undefined,
+      tools: opts.tools,
+      hasHostTools,
       signal: opts.signal,
       onReady: opts.onReady,
       handlers: opts.handlers,
@@ -250,14 +268,33 @@ async function runWithToolLoop(opts: {
 
     const { cleanText, toolCalls } = parseToolCallsFromText(last.content);
     if (!toolCalls.length) {
+      // Manus sometimes "finishes" with only a cloud sandbox path — nudge once
+      if (
+        hasHostTools &&
+        round === 0 &&
+        looksLikeManusSandboxPath(last.content) &&
+        !parseToolCallsFromText(last.content).toolCalls.length
+      ) {
+        log.warn(
+          'TOOL',
+          'sandbox-path',
+          'Manus apontou /home/ubuntu — pedindo reenvio via host tool_call'
+        );
+        prompt =
+          'STOP. You wrote or referenced a Manus sandbox path (/home/ubuntu/…). ' +
+          'That is NOT the user machine. Re-do the deliverable by emitting <tool_call> blocks ' +
+          'using the host tools listed earlier (OpenCode/Codex/builtins). ' +
+          'Do not claim success until tool_calls are emitted.';
+        continue;
+      }
       return { ...last, content: cleanText || last.content };
     }
 
-    // Execute only builtin tools locally; others returned to client
+    // Execute only builtin tools locally; others returned to client (OpenCode/Codex)
     const builtins = toolCalls.filter((t) => isBuiltinTool(t.function.name));
     const external = toolCalls.filter((t) => !isBuiltinTool(t.function.name));
     if (!builtins.length) {
-      // Client-side tools only — surface as-is
+      // Client-side tools only — keep raw content so outer parseToolCallsFromText works
       return last;
     }
 
@@ -277,22 +314,33 @@ async function runWithToolLoop(opts: {
     }
 
     if (external.length) {
-      // mixed: return partial so client can finish external tools
-      return last;
+      // mixed: return so client can finish external tools; keep clean text without tool XML if possible
+      return { ...last, content: last.content };
     }
 
     // Feed results back into same Manus session
     prompt =
-      `Tool results (use them and finish the task — do not wait for the user):\n` +
+      `Tool results from the LOCAL host (use them and finish — do not wait for the user):\n` +
       results.join('\n\n');
   }
 
   return last!;
 }
 
-function toolsPromptFor(clientTools?: OpenAITool[]): { tools: OpenAITool[]; prompt: string } {
-  const tools = mergeTools(clientTools);
-  return { tools, prompt: toolsToSystemPrompt(tools) };
+function toolsPromptFor(clientTools?: OpenAITool[]): ToolsBundle {
+  const client = clientTools || [];
+  const tools = mergeTools(client);
+  const hasClientTools = client.length > 0;
+  const hasBuiltinTools =
+    builtinsEnabled() && tools.some((t) => isBuiltinTool(t.function.name));
+  const prompt = toolsToSystemPrompt(tools, { hasClientTools, hasBuiltinTools });
+  return {
+    tools,
+    prompt,
+    hasClientTools,
+    hasBuiltinTools,
+    hasHostTools: tools.length > 0,
+  };
 }
 
 function buildOutboundPrompt(
@@ -305,15 +353,16 @@ function buildOutboundPrompt(
 } {
   if (continuity.reuseSession && continuity.manusSessionId) {
     // TOKEN SAVER: only latest user/tool turn + tools + autonomy
+    // Tools protocol FIRST so Manus does not skip host tools
     const latest = extractLatestTurn(messages);
     const core = toolsPrompt
-      ? `${latest.text}\n\n${toolsPrompt}`
+      ? `${toolsPrompt}\n\n${latest.text}`
       : latest.text;
     // Re-inject autonomy every turn so long sessions don't "forget"
     return { prompt: withAutonomy(core), images: latest.images };
   }
 
-  // New session: full flatten + tools + autonomy
+  // New session: full flatten + tools + autonomy (tools protocol first)
   const text = flattenMessages(messages);
   const images = collectAllImages(messages);
   const core = toolsPrompt ? `${toolsPrompt}\n\n${text}` : text;
@@ -400,8 +449,8 @@ export async function runChatCompletionNonStream(
   const auth = await ensureAuth(continuity.accountId);
   continuity.accountId = auth.accountId;
 
-  const { tools, prompt: toolsPrompt } = toolsPromptFor(body.tools);
-  void tools;
+  const toolBundle = toolsPromptFor(body.tools);
+  const { tools, prompt: toolsPrompt, hasHostTools } = toolBundle;
   const { prompt, images } = buildOutboundPrompt(body.messages, continuity, toolsPrompt);
   if (!prompt.trim() && images.length === 0) {
     throw new Error('messages produced an empty prompt');
@@ -430,6 +479,7 @@ export async function runChatCompletionNonStream(
       lastEventId: continuity.lastEventId,
       images,
       tools,
+      hasHostTools,
       signal: ac.signal,
       onReady: (ctl) => {
         stopManus = ctl.stop;
@@ -551,7 +601,7 @@ export async function runChatCompletionStream(
     ac.abort('client_disconnect');
   });
 
-  // FIRST BYTE immediately — before auth/playwright — so OpenCode sees a live stream
+  // FIRST BYTE — role only, NO content:"" (OpenCode closes reasoning on first content)
   await writer.write({
     id,
     object: 'chat.completion.chunk',
@@ -560,7 +610,7 @@ export async function runChatCompletionStream(
     choices: [
       {
         index: 0,
-        delta: { role: 'assistant', content: '' },
+        delta: { role: 'assistant' },
         finish_reason: null,
         logprobs: null,
       },
@@ -571,7 +621,8 @@ export async function runChatCompletionStream(
   const authS = await ensureAuth(continuity.accountId);
   continuity.accountId = authS.accountId;
 
-  const { tools, prompt: toolsPrompt } = toolsPromptFor(body.tools);
+  const toolBundle = toolsPromptFor(body.tools);
+  const { tools, prompt: toolsPrompt, hasHostTools } = toolBundle;
   const { prompt, images } = buildOutboundPrompt(body.messages, continuity, toolsPrompt);
   if (!prompt.trim() && images.length === 0) {
     throw new Error('messages produced an empty prompt');
@@ -601,6 +652,7 @@ export async function runChatCompletionStream(
       lastEventId: continuity.lastEventId,
       images,
       tools,
+      hasHostTools,
       signal: ac.signal,
       onReady: (ctl) => {
         stopManus = ctl.stop;
@@ -643,26 +695,10 @@ export async function runChatCompletionStream(
         },
         onAgentEvent: async (ev) => {
           if (writer.aborted()) return;
-          // Safe for OpenCode: SSE comment (ignored by parsers) + optional field
-          // empty delta so clients don't break; manus_agent is additive.
+          // Comments only — empty JSON deltas confuse strict OpenAI-compatible parsers
           await writer.writeComment(
             `manus-agent ${ev.type}${ev.brief ? ' ' + ev.brief.slice(0, 80) : ''}`
           );
-          await writer.write({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model: body.model,
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: null,
-                logprobs: null,
-              },
-            ],
-            manus_agent: ev,
-          });
         },
         onRequiresInput: async (info) => {
           if (writer.aborted()) return;
@@ -715,12 +751,27 @@ export async function runChatCompletionStream(
     unregisterRun(id);
   }
 
+  // If thinking only arrived in the final result (no live deltas), flush once
+  if (result.reasoning && !thinkBridge.hasReasoning && !contentStarted) {
+    for (const ch of thinkBridge.thoughtChunks(baseChunk, result.reasoning)) {
+      await writer.write(ch);
+    }
+  } else if (result.reasoning && thinkBridge.reasoning.length < result.reasoning.length) {
+    const net = result.reasoning.slice(thinkBridge.reasoning.length);
+    if (net) {
+      for (const ch of thinkBridge.thoughtChunks(baseChunk, net)) {
+        await writer.write(ch);
+      }
+    }
+  }
+
   if (!contentStarted) {
     const close = thinkBridge.closeThinkTags(baseChunk);
     if (close) await writer.write(close);
   }
 
-  const finalText = assembled || stripThinkTags(result.content);
+  // Prefer full Manus content for tool_call parsing (assembled may miss XML)
+  const finalText = stripThinkTags(result.content || assembled);
   const { cleanText, toolCalls } = parseToolCallsFromText(finalText);
   const fields = mapTurnToChatFields(result, cleanText, toolCalls);
   const reasoning = thinkBridge.reasoning || result.reasoning || '';
@@ -827,7 +878,8 @@ export async function runResponsesNonStream(
 
   // When reusing: only map *new* input, not full prior dump into prompt
   const newMessages = responsesInputToMessages(body, continuity.reuseSession ? [] : continuity.priorMessages);
-  const { tools, prompt: toolsPrompt } = toolsPromptFor(normalizeResponsesTools(body.tools));
+  const toolBundle = toolsPromptFor(normalizeResponsesTools(body.tools));
+  const { tools, prompt: toolsPrompt, hasHostTools } = toolBundle;
 
   const continuityForPrompt: Continuity = continuity.reuseSession
     ? continuity
@@ -871,6 +923,7 @@ export async function runResponsesNonStream(
       lastEventId: continuity.lastEventId,
       images,
       tools,
+      hasHostTools,
       signal: ac.signal,
       onReady: (ctl) => {
         stopManus = ctl.stop;
@@ -961,7 +1014,8 @@ export async function runResponsesStream(
   continuity.accountId = authRS.accountId;
 
   const newMessages = responsesInputToMessages(body, continuity.reuseSession ? [] : continuity.priorMessages);
-  const { tools, prompt: toolsPrompt } = toolsPromptFor(normalizeResponsesTools(body.tools));
+  const toolBundle = toolsPromptFor(normalizeResponsesTools(body.tools));
+  const { tools, prompt: toolsPrompt, hasHostTools } = toolBundle;
   const messagesForPrompt = continuity.reuseSession
     ? newMessages
     : [...continuity.priorMessages, ...newMessages];
@@ -1021,6 +1075,7 @@ export async function runResponsesStream(
       lastEventId: continuity.lastEventId,
       images,
       tools,
+      hasHostTools,
       signal: ac.signal,
       onReady: (ctl) => {
         stopManus = ctl.stop;

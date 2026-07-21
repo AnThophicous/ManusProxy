@@ -785,13 +785,45 @@ export async function executeBuiltinTool(
   }
 }
 
+/**
+ * Merge host tools.
+ * - Client tools (OpenCode / Codex / Cursor) always win on name collision.
+ * - Builtin workspace tools are optional local helpers (MANUS_BUILTIN_TOOLS=0 to disable).
+ * Client tools are listed first so the model sees them as primary.
+ */
 export function mergeTools(clientTools?: OpenAITool[]): OpenAITool[] {
+  const wantBuiltins = process.env.MANUS_BUILTIN_TOOLS !== '0' && process.env.MANUS_BUILTIN_TOOLS !== 'false';
   const map = new Map<string, OpenAITool>();
-  for (const t of BUILTIN_TOOLS) map.set(t.function.name, t);
+  // Builtins first into map, then client overwrites same names
+  if (wantBuiltins) {
+    for (const t of BUILTIN_TOOLS) map.set(t.function.name, t);
+  }
   for (const t of clientTools || []) map.set(t.function.name, t);
-  return [...map.values()];
+
+  // Stable order: client tools first, then remaining builtins
+  const out: OpenAITool[] = [];
+  const seen = new Set<string>();
+  for (const t of clientTools || []) {
+    const name = t.function.name;
+    if (seen.has(name)) continue;
+    seen.add(name);
+    out.push(map.get(name)!);
+  }
+  if (wantBuiltins) {
+    for (const t of BUILTIN_TOOLS) {
+      const name = t.function.name;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push(map.get(name)!);
+    }
+  }
+  return out;
 }
 
 export function isBuiltinTool(name: string): boolean {
   return BUILTIN_TOOLS.some((t) => t.function.name === name);
+}
+
+export function builtinsEnabled(): boolean {
+  return process.env.MANUS_BUILTIN_TOOLS !== '0' && process.env.MANUS_BUILTIN_TOOLS !== 'false';
 }

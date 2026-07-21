@@ -6,24 +6,70 @@ const TOOL_CALL_RE =
 const TOOL_CALLS_RE =
   /<tool_calls>\s*([\s\S]*?)\s*<\/tool_calls>/gi;
 
-export function toolsToSystemPrompt(tools?: OpenAITool[]): string {
+export type ToolsPromptOptions = {
+  /** True when the HTTP client (OpenCode / Codex / etc.) sent tools */
+  hasClientTools?: boolean;
+  /** Builtin local tools are also in the list */
+  hasBuiltinTools?: boolean;
+};
+
+/**
+ * Protocol for host-side tools (OpenCode, Codex, Cursor, our builtins).
+ * Manus cloud sandbox is NOT the user's machine.
+ */
+export function toolsToSystemPrompt(
+  tools?: OpenAITool[],
+  opts: ToolsPromptOptions = {}
+): string {
   if (!tools?.length) return '';
+
   const schemas = tools.map((t) => ({
     name: t.function.name,
     description: t.function.description || '',
     parameters: t.function.parameters ?? {},
   }));
-  return [
-    'You have access to the following tools. When you need to call a tool, do NOT describe it in prose.',
+
+  const hostBits: string[] = [
+    '[HOST TOOLS PROTOCOL — MANDATORY]',
+    'You are connected to a LOCAL host agent (OpenCode, Codex, Cursor, or ManusProxy builtins).',
+    'The Manus cloud VM / sandbox (/home/ubuntu, /tmp on Manus, remote desktop) is NOT the user computer.',
+    'Anything you write only on the Manus sandbox is INVISIBLE to the user and is a FAILURE.',
+    '',
+    'To create, edit, read, search, or run anything on the USER machine you MUST emit tool calls.',
+    'Do NOT describe a tool call in prose. Do NOT say "file saved at /home/ubuntu/..." as a deliverable.',
     'Emit ONE or MORE blocks exactly like:',
     '<tool_call>',
     '{"name":"tool_name","arguments":{...}}',
     '</tool_call>',
-    'You may call multiple tools. After tool results arrive, continue the task.',
-    'If no tool is needed, answer normally without tool_call tags.',
-    'Available tools JSON:',
+    'You may emit multiple <tool_call> blocks. After tool results arrive, continue the task.',
+    'If no tool is needed (pure Q&A), answer normally without tool_call tags.',
+    '',
+  ];
+
+  if (opts.hasClientTools) {
+    hostBits.push(
+      'The client (OpenCode/Codex/etc.) owns the real workspace on the user PC.',
+      'Prefer the client tools for file and shell work. Those tool_calls are executed by the client, not by Manus.',
+      'Never substitute Manus agent "Build" / remote file creation for a host tool_call.',
+      ''
+    );
+  }
+
+  if (opts.hasBuiltinTools) {
+    hostBits.push(
+      'Builtin tools (workspace, write_file, read_file, search_lines, …) write under the proxy local workspace on the user machine.',
+      'Use them when the client did not provide an equivalent tool, or when the task is pure local sandbox via the proxy.',
+      ''
+    );
+  }
+
+  hostBits.push(
+    'Available tools JSON (ONLY these work for the user):',
     JSON.stringify(schemas, null, 2),
-  ].join('\n');
+    '[/HOST TOOLS PROTOCOL]'
+  );
+
+  return hostBits.join('\n');
 }
 
 export function parseToolCallsFromText(text: string): {
@@ -72,6 +118,21 @@ export function parseToolCallsFromText(text: string): {
     return '';
   });
 
+  // Fallback: invoke tool_name with {...} loose patterns some models emit
+  clean = clean.replace(
+    /(?:call|invoke|run)_tool\s*[:=]\s*(\{[\s\S]*?\})/gi,
+    (_m, inner: string) => {
+      try {
+        const item = JSON.parse(inner.trim());
+        const tc = normalizeToolItem(item);
+        if (tc) toolCalls.push(tc);
+      } catch {
+        /* ignore */
+      }
+      return '';
+    }
+  );
+
   return { cleanText: clean.trim(), toolCalls };
 }
 
@@ -109,4 +170,9 @@ export function toolCallsToSseDeltas(
       arguments: tc.function.arguments,
     },
   }));
+}
+
+/** Paths that usually mean Manus remote sandbox, not user host */
+export function looksLikeManusSandboxPath(text: string): boolean {
+  return /\/home\/ubuntu\b|\/home\/manus\b|\\\\home\\\\ubuntu\b/i.test(text || '');
 }

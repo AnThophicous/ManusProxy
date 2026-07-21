@@ -311,26 +311,34 @@ Aliases: `last_response_id` ≡ `previous_response_id`.
 
 ---
 
-## 🧰 Tools (workspace)
+## 🧰 Tools (host = OpenCode / Codex / builtins)
 
-Tools builtin rodam **no seu PC**, sandboxed em `./workspace` (ou `MANUS_WORKSPACE=`).
+A Manus **não** é o disco do seu PC. Se ela gravar em `/home/ubuntu/...` no sandbox da nuvem, **você não vê o arquivo**.
 
-| Tool | Função |
-|------|--------|
+Com tools no request (OpenCode, Codex, etc.):
+
+1. O proxy manda um **HOST TOOLS PROTOCOL** forte
+2. Por default força `taskMode=chat` (`MANUS_FORCE_CHAT_WITH_TOOLS`) para a Manus **emitir** `<tool_call>` em vez de “Build” no VM remoto
+3. Tool calls do **cliente** voltam como OpenAI `tool_calls` → o OpenCode/Codex executa no **seu** workspace
+4. Tools **builtin** da proxy rodam local em `./workspace` (desligue com `MANUS_BUILTIN_TOOLS=0`)
+
+| Builtin | Função |
+|---------|--------|
 | `workspace` | root + árvore |
-| `write_file` | criar/escrever |
-| `read_file` | ler |
-| `list_dir` | listar |
-| `mkdir` | pasta |
-| `delete_path` | apagar |
-| `move_path` | mover/renomear |
-| `replace_in_file` | replace pontual |
-| `search_files` | achar por nome |
-| `search_lines` | grep com nº de linha |
-| `file_info` | meta do arquivo |
-| `manual_fetch` | HTTP fetch simples |
+| `write_file` / `read_file` | FS local |
+| `list_dir` / `mkdir` / `delete_path` / `move_path` | FS local |
+| `replace_in_file` / `search_files` / `search_lines` / `file_info` | edição/busca |
+| `manual_fetch` | HTTP fetch |
 
-Cliente também pode mandar `tools` no formato OpenAI; o proxy instrui a Manus a emitir `<tool_call>…</tool_call>`.
+Cliente manda `tools` no formato OpenAI; a Manus deve emitir:
+
+```xml
+<tool_call>
+{"name":"write","arguments":{"path":"calculadora.html","content":"..."}}
+</tool_call>
+```
+
+Se a resposta só citar `/home/ubuntu/...`, o proxy **pede um reenvio** via host `tool_call` (uma vez).
 
 ---
 

@@ -118,6 +118,29 @@ export function resolveTaskMode(modelId: string): ManusTaskMode {
   return 'standard';
 }
 
+/**
+ * When the host client (OpenCode/Codex) sends tools, Manus *agent* mode will
+ * happily write files under /home/ubuntu on its cloud VM and never emit host
+ * tool_calls. Force chat-like modes so the model answers with <tool_call> text
+ * that we parse into OpenAI tool_calls for the client.
+ *
+ * Override with MANUS_FORCE_CHAT_WITH_TOOLS=false to keep agent mode.
+ */
+export function resolveTaskModeForTools(
+  modelId: string,
+  hasHostTools: boolean
+): ManusTaskMode {
+  const base = resolveTaskMode(modelId);
+  if (!hasHostTools) return base;
+  const force =
+    process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== '0' &&
+    process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== 'false';
+  if (!force) return base;
+  if (base === 'chat' || base === 'lite') return base;
+  // adaptive keeps some planning but still text-first; prefer chat for tools
+  return 'chat';
+}
+
 function extractAssistantText(event: Record<string, unknown>): string {
   if (event.type === 'chatDelta') {
     const delta = event.delta as { content?: string; thought?: string } | undefined;
@@ -189,11 +212,23 @@ function extractThought(event: Record<string, unknown>): string {
     );
   }
 
-  // liveStatus with long text is sometimes the "thinking out loud" channel
-  if (event.type === 'liveStatus') {
-    const text = String(event.text || event.brief || event.description || '');
-    // skip short UI labels like "Pensando"
+  // liveStatus / statusUpdate with long text is sometimes the "thinking out loud" channel
+  if (event.type === 'liveStatus' || event.type === 'statusUpdate') {
+    const text = String(
+      event.text || event.brief || event.description || event.message || ''
+    );
+    // skip short UI labels like "Pensando" / "Working"
     if (text.length >= 40) return text;
+  }
+
+  // Some agent builds put plan text under payload / data
+  if (event.payload && typeof event.payload === 'object') {
+    const p = pickThoughtFields(event.payload as Record<string, unknown>);
+    if (p) return p;
+  }
+  if (event.data && typeof event.data === 'object') {
+    const d = pickThoughtFields(event.data as Record<string, unknown>);
+    if (d) return d;
   }
 
   return '';
@@ -375,6 +410,10 @@ export async function sendManusChat(opts: {
   images?: Array<{ dataUrl: string; mime: string }>;
   tools?: OpenAITool[];
   toolPromptSuffix?: string;
+  /** Host has OpenAI tools (client and/or builtins) — forces chat mode by default */
+  hasHostTools?: boolean;
+  /** Override Manus taskMode (chat | standard | adaptive | lite) */
+  taskMode?: ManusTaskMode;
   timeoutMs?: number;
   signal?: AbortSignal;
   handlers?: ManusChatStreamHandlers;
@@ -386,7 +425,9 @@ export async function sendManusChat(opts: {
     throw new Error('Sem Authorization JWT — rode npm run login -- --account=<id>');
   }
   const token = jwtFromAuth(auth.authorization);
-  const taskMode = resolveTaskMode(opts.model || 'manus');
+  const taskMode =
+    opts.taskMode ??
+    resolveTaskModeForTools(opts.model || 'manus', Boolean(opts.hasHostTools));
   const isContinue = Boolean(opts.sessionId);
   const sessionId = opts.sessionId || shortUID();
   const messageId = shortUID();

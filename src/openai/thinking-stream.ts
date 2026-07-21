@@ -1,8 +1,8 @@
 /**
  * Thinking / reasoning stream for OpenCode, AI SDK, vLLM.
  *
- * Default: reasoning_content only (clean for agents that render a think panel).
- * content_tags puts <think> in delta.content — only BEFORE any answer content.
+ * Default: reasoning_content only (vLLM / DeepSeek / OpenCode openai-compatible).
+ * Do NOT send empty delta.content — OpenCode closes the reasoning phase on first content.
  *
  * Env MANUS_THINK_MODE:
  *   reasoning_content | both | content_tags | off
@@ -33,32 +33,45 @@ export class ThinkingStreamBridge {
     return this.accumulated;
   }
 
+  get hasReasoning(): boolean {
+    return this.accumulated.trim().length > 0;
+  }
+
   markContentPhase(): void {
     this.contentPhase = true;
   }
 
   /**
-   * Chunks for a thought delta. Never injects <think> after content started.
+   * Chunks for a thought delta.
+   * OpenCode: choices[0].delta.reasoning_content → reasoning-delta parts.
+   * Never include content:"" here — empty content closes reasoning in OpenCode.
    */
   thoughtChunks(
     base: { id: string; created: number; model: string },
     thoughtDelta: string
   ): object[] {
     if (!thoughtDelta || this.mode === 'off') return [];
+    // If answer already started, still allow late reasoning fields (some clients accept)
+    // but never inject <think> tags into content after content phase.
     this.accumulated += thoughtDelta;
     const out: object[] = [];
 
     const useRc =
       this.mode === 'both' || this.mode === 'reasoning_content';
-    // Tags only if we haven't entered answer phase yet
     const useTags =
       (this.mode === 'both' || this.mode === 'content_tags') && !this.contentPhase;
 
     if (useRc) {
-      out.push(makeChunk(base, {
+      // Primary field OpenCode / vLLM / DeepSeek expect
+      const delta: Record<string, unknown> = {
         reasoning_content: thoughtDelta,
-        reasoning: thoughtDelta,
-      }));
+      };
+      // Optional alias for SDKs that only read `reasoning` (not OpenCode default)
+      if (this.mode === 'both' || process.env.MANUS_THINK_ALIAS === '1') {
+        delta.reasoning = thoughtDelta;
+      }
+      out.push(makeChunk(base, delta));
+      this.opened = true;
     }
 
     if (useTags) {
@@ -68,8 +81,6 @@ export class ThinkingStreamBridge {
         contentPiece = `<think>\n${thoughtDelta}`;
       }
       out.push(makeChunk(base, { content: contentPiece }));
-    } else if (useRc) {
-      this.opened = true;
     }
 
     return out;
@@ -101,10 +112,10 @@ export class ThinkingStreamBridge {
 
     if (this.mode === 'both' || this.mode === 'reasoning_content') {
       message.reasoning_content = r;
-      message.reasoning = r;
+      if (this.mode === 'both' || process.env.MANUS_THINK_ALIAS === '1') {
+        message.reasoning = r;
+      }
     }
-    // Don't wrap content with tags in non-stream for OpenCode — use field only
-    // (avoids raw <think> in final message UI)
     return message;
   }
 }
