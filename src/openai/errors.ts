@@ -10,6 +10,16 @@ export function toErrorBody(err: unknown) {
       },
     };
   }
+  if (/cr[eé]dito|credit|quota|esgotad/i.test(message)) {
+    return {
+      error: {
+        message,
+        type: 'insufficient_quota',
+        param: null,
+        code: 'insufficient_quota',
+      },
+    };
+  }
   return {
     error: {
       message,
@@ -26,5 +36,6 @@ export function statusFromError(err: unknown): number {
   if (/login|sess[aã]o|unauthorized|401/i.test(message)) return 401;
   if (/not found|404/i.test(message)) return 404;
   if (/invalid|missing required/i.test(message)) return 400;
+  if (/cr[eé]dito|credit|quota|esgotad/i.test(message)) return 402;
   return 500;
 }

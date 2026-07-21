@@ -4,7 +4,12 @@ import { sendManusChat, type ManusChatResult } from '../manus/ws.ts';
 import { withAutonomy } from '../manus/autonomy.ts';
 import { getPreferredAccount } from '../account/pool.ts';
 import { storeEncryptedAuth, markAccountReady } from '../account/store.ts';
-import { ensureAccountWithCredits, rotateAccount } from '../account/rotator.ts';
+import {
+  ensureAccountWithCredits,
+  rotateAccount,
+  creditsExhausted,
+  readCredits,
+} from '../account/rotator.ts';
 import { responseStore } from '../store/response-store.ts';
 import {
   collectAllImages,
@@ -175,6 +180,22 @@ function resolveContinuity(
   };
 }
 
+function assertCreditsOk(result: ManusChatResult): void {
+  if (result.creditsExhausted || result.status === 'credits_exhausted') {
+    throw new Error(
+      stripHostNudgeFrom(result.content) ||
+        'Créditos da Manus esgotados nesta conta. Espere o refresh diário, troque de conta (x-manus-account) ou faça upgrade no manus.im.'
+    );
+  }
+}
+
+function stripHostNudgeFrom(text: string): string {
+  return (text || '')
+    .replace(/\[HOST[^\]]*\][^\n]*/gi, '')
+    .replace(/Continue with <tool_call>[\s\S]*?No narration\.[^\n]*/gi, '')
+    .trim();
+}
+
 async function ensureAuth(accountId: string): Promise<{ accountId: string; rotated: boolean }> {
   let id = accountId;
   let rotated = false;
@@ -182,13 +203,24 @@ async function ensureAuth(accountId: string): Promise<{ accountId: string; rotat
   // Credit-aware rotation before burn
   try {
     const pick = await ensureAccountWithCredits(id);
+    id = pick.accountId;
+    rotated = pick.rotated;
     if (pick.rotated) {
-      id = pick.accountId;
-      rotated = true;
       log.ok('ROTATE', id, `using account with credits=${pick.credits.total}`);
     }
-  } catch {
-    /* continue with original */
+    if (creditsExhausted(pick.credits)) {
+      // double-check live
+      const live = await readCredits(id);
+      if (creditsExhausted(live)) {
+        throw new Error(
+          `Créditos da Manus esgotados (conta=${id}, total=${live.total}). ` +
+            `Refresh diário ou faça login em outra conta: npm run login -- --account=outra`
+        );
+      }
+    }
+  } catch (e) {
+    if (e instanceof Error && /cr[eé]dito|credit/i.test(e.message)) throw e;
+    /* continue with original if rotation plumbing failed */
   }
 
   let user = await getUserInfo(id);
@@ -489,6 +521,8 @@ export async function runChatCompletionNonStream(
   } finally {
     unregisterRun(id);
   }
+
+  assertCreditsOk(result);
 
   const { cleanText, toolCalls } = parseToolCallsFromText(result.content);
   const fields = mapTurnToChatFields(result, cleanText, toolCalls);
@@ -791,6 +825,16 @@ export async function runChatCompletionStream(
     throw err;
   } finally {
     unregisterRun(id);
+  }
+
+  // Credits gone mid-stream: emit clean error instead of more nudges
+  if (result.creditsExhausted || result.status === 'credits_exhausted') {
+    const msg =
+      stripHostNudgeFrom(result.content) ||
+      'Créditos da Manus esgotados. Espere o refresh diário ou troque de conta.';
+    await writer.writeError(msg, 'insufficient_quota', 'insufficient_quota');
+    await writer.writeDone();
+    return;
   }
 
   // If thinking only arrived in the final result (no live deltas), flush once

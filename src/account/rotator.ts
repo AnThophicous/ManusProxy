@@ -32,6 +32,7 @@ export async function readCredits(accountId: string): Promise<CreditsSnapshot> {
 
 export function creditsExhausted(snap: CreditsSnapshot): boolean {
   if (!snap.ok) return true;
+  // Manus free tier can go negative when overdrawn
   return snap.total <= 0 && snap.free <= 0 && snap.refresh <= 0;
 }
 

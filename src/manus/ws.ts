@@ -15,7 +15,8 @@ export type ManusTurnStatus =
   | 'completed'
   | 'requires_input'
   | 'cancelled'
-  | 'error';
+  | 'error'
+  | 'credits_exhausted';
 
 export type ManusContentPart =
   | { type: 'text'; value: string }
@@ -41,6 +42,8 @@ export type ManusChatResult = {
   events: unknown[];
   status: ManusTurnStatus;
   requiresInput?: ManusRequiresInput;
+  /** Set when Manus reports no credits / quota */
+  creditsExhausted?: boolean;
 };
 
 /** Agent desktop / sandbox / tool activity (safe extras for SSE) */
@@ -260,6 +263,38 @@ export function hasIncompleteToolMarkup(text: string): boolean {
   if (/```tool_call/i.test(s) && !/```tool_call[\s\S]*?```/i.test(s)) return true;
   return false;
 }
+
+/** Manus out of free/paid credits — stop nudging and fail cleanly */
+export function detectCreditsExhausted(text: string): boolean {
+  const t = (text || '').toLowerCase();
+  if (!t.trim()) return false;
+  return (
+    /cr[eé]ditos?\s+(foram\s+)?(usados|esgotados|insuficientes)/i.test(t) ||
+    /seus cr[eé]ditos foram/i.test(t) ||
+    /out of credits/i.test(t) ||
+    /insufficient\s+(credits?|quota)/i.test(t) ||
+    /no credits? (left|remaining|available)/i.test(t) ||
+    /atualize seu plano para obter mais cr[eé]ditos/i.test(t) ||
+    /upgrade.*(plan|subscription).*credits?/i.test(t) ||
+    /get more credits/i.test(t) ||
+    /obtenha mais cr[eé]ditos/i.test(t) ||
+    /quota\s+(exceeded|exhausted)/i.test(t) ||
+    /insufficient_feature_quota/i.test(t)
+  );
+}
+
+export function stripHostNudgeLeak(text: string): string {
+  return (text || '')
+    .replace(/\[HOST NUDGE #[\s\S]*?(?=\n\[|$)/gi, '')
+    .replace(/You already announced the plan\.[\s\S]*?plain text only\./gi, '')
+    .replace(/The Manus cloud sandbox is NOT the user machine\./gi, '')
+    .replace(/IMMEDIATELY emit one or more <tool_call>[\s\S]*?<\/tool_call> blocks/gi, '')
+    .trim();
+}
+
+const CREDITS_EXHAUSTED_USER_MSG =
+  'Créditos da Manus esgotados nesta conta. ' +
+  'Espere o refresh diário, troque de conta (x-manus-account) ou faça upgrade no manus.im.';
 
 /**
  * Extract Manus thinking text from various event shapes.
@@ -575,6 +610,7 @@ export async function sendManusChat(opts: {
     let lastActivityAt = Date.now();
     let lastAgentActivityAt = 0;
     let nudgeCount = 0;
+    let creditsExhausted = false;
     let turnStatus: ManusTurnStatus = 'completed';
     let requiresInput: ManusRequiresInput | undefined;
     let stopGrace: ReturnType<typeof setTimeout> | null = null;
@@ -602,6 +638,8 @@ export async function sendManusChat(opts: {
      * This was the root cause of "Build · Manus · 26s" then silence.
      */
     const canComplete = (reason: 'idle' | 'stopped' | 'session_stopped' | 'timeout'): boolean => {
+      // Out of credits → always allow finish (nudging is useless)
+      if (creditsExhausted) return true;
       if (agentRunning) {
         console.log(`[manus-ws] block finish (${reason}): agent still running`);
         return false;
@@ -628,6 +666,13 @@ export async function sendManusChat(opts: {
       clearIdle();
       opts.signal?.removeEventListener('abort', onAbort);
       if (status) turnStatus = status;
+      // Never leak host-nudge text into the client-facing body
+      content = stripHostNudgeLeak(content);
+      if (creditsExhausted && !content.includes('Créditos da Manus')) {
+        content = content
+          ? `${content}\n\n${CREDITS_EXHAUSTED_USER_MSG}`
+          : CREDITS_EXHAUSTED_USER_MSG;
+      }
       try {
         socket?.disconnect();
       } catch {
@@ -643,6 +688,7 @@ export async function sendManusChat(opts: {
             lastEventId,
             events,
             status: 'cancelled',
+            creditsExhausted,
           });
           return;
         }
@@ -655,61 +701,27 @@ export async function sendManusChat(opts: {
           reasoning: reasoning.trim(),
           lastEventId,
           events,
-          status: turnStatus,
+          status: creditsExhausted ? 'credits_exhausted' : turnStatus,
           requiresInput,
+          creditsExhausted,
         });
-      }
-    };
-
-    /** Push a follow-up user_message in-session so Manus actually emits tool_calls */
-    const sendContinueNudge = (why: string): boolean => {
-      if (settled || !socket?.connected) return false;
-      if (nudgeCount >= 3) return false;
-      if (!hasHostTools && !looksLikeTurnPreamble(content)) return false;
-      nudgeCount += 1;
-      markActivity('text');
-      const nudgeText = [
-        `[HOST NUDGE #${nudgeCount} — ${why}]`,
-        'You already announced the plan. STOP narrating.',
-        'The Manus cloud sandbox is NOT the user machine.',
-        'IMMEDIATELY emit one or more <tool_call>{"name":"...","arguments":{...}}</tool_call> blocks',
-        'using the HOST tools listed in the system protocol (OpenCode/Codex/builtins).',
-        'Do not wait. Do not ask. Do not only describe files — CALL the tools now.',
-        'If the task is pure Q&A with no files, give the final answer in plain text only.',
-      ].join('\n');
-
-      const payload = {
-        id: shortUID(),
-        timestamp: Date.now(),
-        messageStatus: 'pending',
-        type: 'user_message',
-        sessionId,
-        content: '',
-        contents: [{ type: 'text', value: nudgeText }],
-        messageType: 'text',
-        // always chat for host-tool recovery — never re-enter agent Build
-        taskMode: 'chat' as ManusTaskMode,
-        attachments: [] as unknown[],
-        extData: {} as Record<string, unknown>,
-      };
-      console.log(
-        `[manus-ws] continue nudge #${nudgeCount} session=${sessionId} why=${why}`
-      );
-      try {
-        socket.emit('message', payload);
-        return true;
-      } catch {
-        return false;
       }
     };
 
     /**
      * Idle-based completion. Incomplete host-tool turns get NUDGED, not closed.
+     * Out of credits → finish immediately (no nudge spam).
      */
     const bumpIdle = () => {
       if (settled) return;
       clearIdle();
       markActivity('text');
+
+      if (creditsExhausted || detectCreditsExhausted(content)) {
+        creditsExhausted = true;
+        idleTimer = setTimeout(() => finish(undefined, 'credits_exhausted'), 150);
+        return;
+      }
 
       let idleMs = isChatMode ? 2_500 : 5_000;
       if (agentRunning) idleMs = 15_000;
@@ -720,9 +732,15 @@ export async function sendManusChat(opts: {
         if (settled) return;
         if (!(content || sawAssistantChat || reasoning)) return;
 
+        if (creditsExhausted || detectCreditsExhausted(content)) {
+          creditsExhausted = true;
+          finish(undefined, 'credits_exhausted');
+          return;
+        }
+
         if (!canComplete('idle')) {
           // Root recovery: push Manus to emit tool_calls instead of dying
-          if (isIncompleteHostToolTurn(content, hasHostTools) && nudgeCount < 3) {
+          if (isIncompleteHostToolTurn(content, hasHostTools) && nudgeCount < 2) {
             if (sendContinueNudge('idle_incomplete')) {
               bumpIdle();
               return;
@@ -748,10 +766,19 @@ export async function sendManusChat(opts: {
       }, idleMs);
     };
 
-    const scheduleFinish = (ms = 450, status?: ManusTurnStatus, reason: 'stopped' | 'session_stopped' = 'stopped') => {
+    const scheduleFinish = (
+      ms = 450,
+      status?: ManusTurnStatus,
+      reason: 'stopped' | 'session_stopped' = 'stopped'
+    ) => {
       if (stopGrace) clearTimeout(stopGrace);
       stopGrace = setTimeout(() => {
         if (settled) return;
+        if (creditsExhausted || status === 'credits_exhausted') {
+          clearIdle();
+          finish(undefined, 'credits_exhausted');
+          return;
+        }
         if (!canComplete(reason)) {
           if (isIncompleteHostToolTurn(content, hasHostTools) && sendContinueNudge(reason)) {
             bumpIdle();
@@ -765,6 +792,56 @@ export async function sendManusChat(opts: {
         clearIdle();
         finish(undefined, status);
       }, ms);
+    };
+
+    const markCreditsExhausted = (source: string) => {
+      if (creditsExhausted && settled) return;
+      creditsExhausted = true;
+      agentRunning = false;
+      console.log(`[manus-ws] credits exhausted (${source}) session=${sessionId}`);
+      scheduleFinish(150, 'credits_exhausted', 'stopped');
+    };
+
+    /** Push a follow-up user_message in-session so Manus actually emits tool_calls */
+    const sendContinueNudge = (why: string): boolean => {
+      if (settled || !socket?.connected) return false;
+      if (creditsExhausted) return false;
+      if (detectCreditsExhausted(content)) {
+        markCreditsExhausted('nudge_blocked_by_content');
+        return false;
+      }
+      if (nudgeCount >= 2) return false;
+      if (!hasHostTools && !looksLikeTurnPreamble(content)) return false;
+      nudgeCount += 1;
+      markActivity('text');
+      // Compact nudge — less noise if it appears in Manus session history
+      const nudgeText = [
+        `[HOST] Continue with <tool_call>{"name":"…","arguments":{…}}</tool_call> only.`,
+        `Use host tools (OpenCode/Codex/builtins). No Manus sandbox. No narration. (#${nudgeCount}/${why})`,
+      ].join(' ');
+
+      const payload = {
+        id: shortUID(),
+        timestamp: Date.now(),
+        messageStatus: 'pending',
+        type: 'user_message',
+        sessionId,
+        content: '',
+        contents: [{ type: 'text', value: nudgeText }],
+        messageType: 'text',
+        taskMode: 'chat' as ManusTaskMode,
+        attachments: [] as unknown[],
+        extData: {} as Record<string, unknown>,
+      };
+      console.log(
+        `[manus-ws] continue nudge #${nudgeCount} session=${sessionId} why=${why}`
+      );
+      try {
+        socket.emit('message', payload);
+        return true;
+      } catch {
+        return false;
+      }
     };
 
     const sendStop = () => {
@@ -881,6 +958,10 @@ export async function sendManusChat(opts: {
 
     const applyAssistantPiece = async (piece: string, isCumulative = false) => {
       if (!piece) return;
+      // Never stream host-nudge echoes into the client
+      if (/\[HOST NUDGE|#HOST\]|Continue with <tool_call>/i.test(piece) && piece.length < 500) {
+        return;
+      }
       let net = '';
 
       if (isCumulative || (content && piece.startsWith(content) && piece.length > content.length)) {
@@ -911,6 +992,12 @@ export async function sendManusChat(opts: {
       if (net) {
         sawAssistantChat = true;
         markActivity('text');
+        // Credits dead → stream the Manus message once then finish (no more nudges)
+        if (detectCreditsExhausted(content) || detectCreditsExhausted(net)) {
+          await opts.handlers?.onDelta?.(net);
+          markCreditsExhausted('assistant_text');
+          return;
+        }
         await opts.handlers?.onDelta?.(net);
         bumpIdle();
       }
