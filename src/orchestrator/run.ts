@@ -33,6 +33,7 @@ import {
 } from '../tools/builtin.ts';
 import { log } from '../cli/log-bus.ts';
 import { ThinkingStreamBridge, stripThinkTags } from '../openai/thinking-stream.ts';
+import { emitProgressive } from '../openai/progressive.ts';
 import {
   buildOutputItems,
   buildResponseObject,
@@ -670,28 +671,43 @@ export async function runChatCompletionStream(
             const close = thinkBridge.closeThinkTags(baseChunk);
             if (close) await writer.write(close);
           }
-          assembled += piece;
-          await writer.write({
-            id,
-            object: 'chat.completion.chunk',
-            created,
-            model: body.model,
-            choices: [
-              {
-                index: 0,
-                delta: { content: piece },
-                finish_reason: null,
-                logprobs: null,
-              },
-            ],
-          });
+          // Progressive micro-chunks so OpenCode typewriters instead of dumping a wall
+          await emitProgressive(
+            piece,
+            async (slice) => {
+              if (writer.aborted() || !slice) return;
+              assembled += slice;
+              await writer.write({
+                id,
+                object: 'chat.completion.chunk',
+                created,
+                model: body.model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: slice },
+                    finish_reason: null,
+                    logprobs: null,
+                  },
+                ],
+              });
+            },
+            { aborted: () => writer.aborted() }
+          );
         },
         onThought: async (thought) => {
           if (!thought || writer.aborted()) return;
-          const chunks = thinkBridge.thoughtChunks(baseChunk, thought);
-          for (const ch of chunks) {
-            await writer.write(ch);
-          }
+          await emitProgressive(
+            thought,
+            async (slice) => {
+              if (writer.aborted() || !slice) return;
+              const chunks = thinkBridge.thoughtChunks(baseChunk, slice);
+              for (const ch of chunks) {
+                await writer.write(ch);
+              }
+            },
+            { maxChunk: 28, delayMs: 10, aborted: () => writer.aborted() }
+          );
         },
         onAgentEvent: async (ev) => {
           if (writer.aborted()) return;
@@ -1083,14 +1099,30 @@ export async function runResponsesStream(
       handlers: {
         onDelta: async (text) => {
           if (!text || writer.aborted()) return;
-          assembled += text;
-          if (!text.includes('<tool_call') && !assembled.includes('<tool_call')) {
-            await emitter.emitTextDelta(text);
+          if (text.includes('<tool_call') || assembled.includes('<tool_call')) {
+            assembled += text;
+            return;
           }
+          await emitProgressive(
+            text,
+            async (slice) => {
+              if (writer.aborted() || !slice) return;
+              assembled += slice;
+              await emitter.emitTextDelta(slice);
+            },
+            { aborted: () => writer.aborted() }
+          );
         },
         onThought: async (thought) => {
           if (!thought || writer.aborted()) return;
-          await emitter.emitReasoningDelta(thought);
+          await emitProgressive(
+            thought,
+            async (slice) => {
+              if (writer.aborted() || !slice) return;
+              await emitter.emitReasoningDelta(slice);
+            },
+            { maxChunk: 28, delayMs: 10, aborted: () => writer.aborted() }
+          );
         },
         onRequiresInput: async (info) => {
           if (writer.aborted()) return;

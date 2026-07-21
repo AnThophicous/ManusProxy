@@ -141,15 +141,79 @@ export function resolveTaskModeForTools(
   return 'chat';
 }
 
-function extractAssistantText(event: Record<string, unknown>): string {
-  if (event.type === 'chatDelta') {
-    const delta = event.delta as { content?: string; thought?: string } | undefined;
-    return delta?.content || '';
+function pickStringContent(obj: unknown): string {
+  if (!obj) return '';
+  if (typeof obj === 'string') return obj;
+  if (typeof obj !== 'object') return '';
+  const rec = obj as Record<string, unknown>;
+  for (const k of ['content', 'text', 'value', 'message', 'delta']) {
+    const v = rec[k];
+    if (typeof v === 'string' && v) return v;
   }
-  if (event.type === 'chat' && event.sender === 'assistant') {
-    return String(event.content || '');
+  // contents: [{type:'text', value:'...'}]
+  if (Array.isArray(rec.contents)) {
+    return rec.contents
+      .map((c) => {
+        if (!c || typeof c !== 'object') return '';
+        const p = c as Record<string, unknown>;
+        if (typeof p.value === 'string') return p.value;
+        if (typeof p.text === 'string') return p.text;
+        if (typeof p.content === 'string') return p.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('');
   }
   return '';
+}
+
+function extractAssistantText(event: Record<string, unknown>): string {
+  const type = String(event.type || '');
+
+  if (type === 'chatDelta' || type === 'chat_delta' || type === 'assistantDelta') {
+    const delta = event.delta as Record<string, unknown> | string | undefined;
+    if (typeof delta === 'string') return delta;
+    const fromDelta = pickStringContent(delta);
+    if (fromDelta) return fromDelta;
+    // some payloads put incremental text on the event itself
+    const direct = pickStringContent(event);
+    if (direct && direct !== String(event.type)) return direct;
+    return '';
+  }
+
+  if (
+    (type === 'chat' || type === 'assistantMessage' || type === 'assistant_message') &&
+    (event.sender === 'assistant' || event.role === 'assistant' || !event.sender)
+  ) {
+    return pickStringContent(event) || String(event.content || '');
+  }
+
+  // Streaming-ish aliases
+  if (type === 'messageDelta' || type === 'textDelta' || type === 'token') {
+    return pickStringContent(event.delta) || pickStringContent(event);
+  }
+
+  return '';
+}
+
+function isAssistantChatEvent(event: Record<string, unknown>): boolean {
+  const type = String(event.type || '');
+  if (type === 'chatDelta' || type === 'chat_delta' || type === 'assistantDelta') return true;
+  if (type === 'messageDelta' || type === 'textDelta' || type === 'token') return true;
+  if (type === 'chat' || type === 'assistantMessage' || type === 'assistant_message') {
+    return event.sender === 'assistant' || event.role === 'assistant' || !event.sender;
+  }
+  return false;
+}
+
+/** Content that looks like "I'm about to work" — do not close the turn yet */
+export function looksLikeTurnPreamble(text: string): boolean {
+  const t = (text || '').trim();
+  if (!t || t.length > 1200) return false;
+  if (t.includes('<tool_call') || t.includes('```tool_call')) return false;
+  return /vou (criar|verificar|preparar|escrever|implementar|montar)|deixe-me|com certeza|plano para|let me |i('ll| will) |i'm going to |checking the environment/i.test(
+    t
+  );
 }
 
 /**
@@ -425,9 +489,10 @@ export async function sendManusChat(opts: {
     throw new Error('Sem Authorization JWT — rode npm run login -- --account=<id>');
   }
   const token = jwtFromAuth(auth.authorization);
+  const hasHostTools = Boolean(opts.hasHostTools);
   const taskMode =
     opts.taskMode ??
-    resolveTaskModeForTools(opts.model || 'manus', Boolean(opts.hasHostTools));
+    resolveTaskModeForTools(opts.model || 'manus', hasHostTools);
   const isContinue = Boolean(opts.sessionId);
   const sessionId = opts.sessionId || shortUID();
   const messageId = shortUID();
@@ -457,14 +522,23 @@ export async function sendManusChat(opts: {
     let turnStatus: ManusTurnStatus = 'completed';
     let requiresInput: ManusRequiresInput | undefined;
     let stopGrace: ReturnType<typeof setTimeout> | null = null;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
     const events: unknown[] = [];
     let socket: Socket | null = null;
+
+    const clearIdle = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
 
     const finish = (err?: Error, status?: ManusTurnStatus) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (stopGrace) clearTimeout(stopGrace);
+      clearIdle();
       opts.signal?.removeEventListener('abort', onAbort);
       if (status) turnStatus = status;
       try {
@@ -500,8 +574,40 @@ export async function sendManusChat(opts: {
       }
     };
 
+    /**
+     * Idle-based completion (NOT finish-on-first-chat).
+     * Premature finish was killing the turn after the intro paragraph
+     * while Manus was still working / about to emit tool_calls.
+     */
+    const bumpIdle = () => {
+      if (settled) return;
+      clearIdle();
+      const hasToolMarkup =
+        content.includes('<tool_call') || content.includes('```tool_call');
+      const preamble = looksLikeTurnPreamble(content);
+      // Waiting for host tools after a "vou criar..." intro — stay open longer
+      let idleMs = isChatMode ? 1_800 : 3_500;
+      if (hasHostTools && !hasToolMarkup && (preamble || content.length < 80)) {
+        idleMs = 75_000;
+      } else if (hasHostTools && !hasToolMarkup) {
+        idleMs = 25_000;
+      } else if (agentRunning) {
+        idleMs = 12_000;
+      }
+      idleTimer = setTimeout(() => {
+        if (settled) return;
+        if (content || sawAssistantChat || reasoning) {
+          console.log(
+            `[manus-ws] idle finish session=${sessionId} mode=${taskMode} chars=${content.length} tools=${hasHostTools}`
+          );
+          finish(undefined, 'completed');
+        }
+      }, idleMs);
+    };
+
     const scheduleFinish = (ms = 450, status?: ManusTurnStatus) => {
       if (stopGrace) clearTimeout(stopGrace);
+      clearIdle();
       stopGrace = setTimeout(() => finish(undefined, status), ms);
     };
 
@@ -532,6 +638,10 @@ export async function sendManusChat(opts: {
       else if (content) finish(undefined, 'completed');
       else finish(new Error(`Timeout after ${timeoutMs}ms waiting Manus reply`));
     }, timeoutMs);
+
+    console.log(
+      `[manus-ws] start session=${sessionId} mode=${taskMode} chatMode=${isChatMode} hostTools=${hasHostTools} model=${opts.model || 'manus'}`
+    );
 
     socket = io('wss://api.manus.im', {
       path: '/socket.io/',
@@ -613,27 +723,78 @@ export async function sendManusChat(opts: {
       scheduleFinish(200, 'requires_input');
     };
 
+    const applyAssistantPiece = async (piece: string, isCumulative = false) => {
+      if (!piece) return;
+      let net = '';
+
+      if (isCumulative || (content && piece.startsWith(content) && piece.length > content.length)) {
+        if (piece === content) return;
+        if (piece.startsWith(content)) {
+          net = piece.slice(content.length);
+          content = piece;
+        } else if (content.startsWith(piece)) {
+          return; // older shorter snapshot
+        } else if (piece.length >= content.length) {
+          // divergent full message — take newer
+          net = piece;
+          content = piece;
+        }
+      } else {
+        if (!piece) return;
+        if (content.endsWith(piece)) return;
+        // delta may itself be cumulative sometimes
+        if (piece.startsWith(content) && piece.length > content.length) {
+          net = piece.slice(content.length);
+          content = piece;
+        } else {
+          content += piece;
+          net = piece;
+        }
+      }
+
+      if (net) {
+        sawAssistantChat = true;
+        await opts.handlers?.onDelta?.(net);
+        bumpIdle();
+      }
+    };
+
     const handleEvent = async (ev: Record<string, unknown>) => {
       if (ev.id) lastEventId = String(ev.id);
       await opts.handlers?.onEvent?.(ev);
+
+      if (process.env.MANUS_WS_DEBUG) {
+        console.log(
+          `[manus-ws] ev type=${ev.type} sender=${ev.sender || ''} keys=${Object.keys(ev).slice(0, 12).join(',')}`
+        );
+      }
 
       const thoughtRaw = extractThought(ev);
       if (thoughtRaw) {
         const { full, net } = mergeThoughtDelta(reasoning, thoughtRaw);
         reasoning = full;
-        if (net) await opts.handlers?.onThought?.(net);
+        if (net) {
+          await opts.handlers?.onThought?.(net);
+          bumpIdle();
+        }
       }
 
       // Agent desktop / sandbox / tools (optional SSE side-channel)
       const agentEv = toAgentEvent(ev);
       if (agentEv) {
         await opts.handlers?.onAgentEvent?.(agentEv);
+        if (agentEv.type === 'toolUsed' || agentEv.type === 'liveStatus' || agentEv.type === 'statusUpdate') {
+          bumpIdle();
+        }
       }
 
       if (ev.type === 'statusUpdate') {
         const st = String(ev.agentStatus || '');
         await opts.handlers?.onStatus?.(st, ev);
-        if (st === 'running' || st === 'thinking') agentRunning = true;
+        if (st === 'running' || st === 'thinking' || st === 'working') {
+          agentRunning = true;
+          bumpIdle();
+        }
         if (st === 'stopped') agentRunning = false;
       }
 
@@ -641,7 +802,6 @@ export async function sendManusChat(opts: {
       const need = detectRequiresInput(ev);
       if (need) {
         if (!content && need.prompt) {
-          // surface the wait prompt as content if we have no assistant text yet
           content = need.prompt;
           await opts.handlers?.onDelta?.(need.prompt);
         }
@@ -649,46 +809,58 @@ export async function sendManusChat(opts: {
         return;
       }
 
-      if (ev.type === 'chatDelta') {
+      // Streaming + final assistant text (many event type aliases)
+      if (isAssistantChatEvent(ev)) {
         const piece = extractAssistantText(ev);
+        const type = String(ev.type || '');
+        const isDelta =
+          type.includes('Delta') ||
+          type.includes('delta') ||
+          type === 'token' ||
+          type === 'textDelta';
         if (piece) {
-          if (content && piece.startsWith(content)) {
-            const net = piece.slice(content.length);
-            content = piece;
-            if (net) await opts.handlers?.onDelta?.(net);
-          } else if (!content.endsWith(piece)) {
-            content += piece;
-            await opts.handlers?.onDelta?.(piece);
-          }
+          await applyAssistantPiece(piece, !isDelta);
         }
-      }
-
-      if (ev.type === 'chat' && ev.sender === 'assistant') {
-        const full = String(ev.content || '');
-        if (full) {
-          if (!content || full.length >= content.length) {
-            const prev = content;
-            content = full;
-            if (full.startsWith(prev)) {
-              const net = full.slice(prev.length);
-              if (net) await opts.handlers?.onDelta?.(net);
-            } else if (!prev) {
-              await opts.handlers?.onDelta?.(full);
-            }
-          }
-          sawAssistantChat = true;
-        }
-
-        // Chat/lite: one-shot answer → finish
-        // Agent modes: keep listening until stopped / requires_input
-        if (isChatMode && full) {
-          scheduleFinish(500, 'completed');
-        }
+        // NEVER finish-on-first-chat — that killed progressive tool work.
+        // Idle timer or status=stopped decides.
       }
 
       if (ev.type === 'statusUpdate' && ev.agentStatus === 'stopped') {
-        if (sawAssistantChat || content) scheduleFinish(350, 'completed');
-        else if (!agentRunning) scheduleFinish(800, 'completed');
+        // Only hard-finish when we already have content/tools, after a short settle
+        if (sawAssistantChat || content) scheduleFinish(450, 'completed');
+        else if (!agentRunning) scheduleFinish(1_200, 'completed');
+      }
+    };
+
+    const unwrapAndHandle = async (raw: unknown) => {
+      if (raw == null) return;
+      if (Array.isArray(raw)) {
+        for (const item of raw) await unwrapAndHandle(item);
+        return;
+      }
+      if (typeof raw !== 'object') return;
+      const msg = raw as Record<string, unknown>;
+
+      // Standard envelope: { type: 'event', event: {...} }
+      if (msg.type === 'event' && msg.event && typeof msg.event === 'object') {
+        await handleEvent(msg.event as Record<string, unknown>);
+        return;
+      }
+      // Nested data.event
+      if (msg.data && typeof msg.data === 'object') {
+        const data = msg.data as Record<string, unknown>;
+        if (data.type === 'event' && data.event && typeof data.event === 'object') {
+          await handleEvent(data.event as Record<string, unknown>);
+          return;
+        }
+        if (data.type) {
+          await handleEvent(data);
+          return;
+        }
+      }
+      // Direct event with type (chatDelta, chat, statusUpdate, …)
+      if (msg.type) {
+        await handleEvent(msg);
       }
     };
 
@@ -697,12 +869,7 @@ export async function sendManusChat(opts: {
         try {
           events.push(raw);
           await opts.handlers?.onEvent?.(raw);
-          const msg = raw as Record<string, unknown>;
-          if (msg.type === 'event' && msg.event && typeof msg.event === 'object') {
-            await handleEvent(msg.event as Record<string, unknown>);
-          } else if (msg.type && (msg as { sender?: string }).sender) {
-            await handleEvent(msg);
-          }
+          await unwrapAndHandle(raw);
         } catch (e) {
           console.warn('[manus-ws] message handler error', e);
         }
