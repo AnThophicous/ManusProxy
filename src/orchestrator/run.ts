@@ -1223,6 +1223,16 @@ export async function runResponsesStream(
     unregisterRun(responseId);
   }
 
+  if (result.creditsExhausted || result.status === 'credits_exhausted') {
+    await writer.writeError(
+      stripHostNudgeFrom(result.content) ||
+        'Créditos da Manus esgotados. Espere o refresh diário ou troque de conta.',
+      'insufficient_quota',
+      'insufficient_quota'
+    );
+    return;
+  }
+
   if (result.status === 'cancelled' || writer.aborted()) {
     await writer.writeEvent('response.cancelled', {
       type: 'response.cancelled',
