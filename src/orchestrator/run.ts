@@ -641,7 +641,33 @@ export async function runChatCompletionStream(
 
   const thinkBridge = new ThinkingStreamBridge();
   let contentStarted = false;
+  let toolHold = false; // buffer <tool_call> — never dump XML as content to OpenCode
   const baseChunk = { id, created, model: body.model };
+
+  const writeContentSlice = async (slice: string) => {
+    if (writer.aborted() || !slice) return;
+    if (!contentStarted) {
+      contentStarted = true;
+      thinkBridge.markContentPhase();
+      const close = thinkBridge.closeThinkTags(baseChunk);
+      if (close) await writer.write(close);
+    }
+    assembled += slice;
+    await writer.write({
+      id,
+      object: 'chat.completion.chunk',
+      created,
+      model: body.model,
+      choices: [
+        {
+          index: 0,
+          delta: { content: slice },
+          finish_reason: null,
+          logprobs: null,
+        },
+      ],
+    });
+  };
 
   let result: ManusChatResult;
   try {
@@ -665,35 +691,35 @@ export async function runChatCompletionStream(
           let piece = stripThinkTags(text);
           if (!piece) return;
 
-          if (!contentStarted) {
-            contentStarted = true;
-            thinkBridge.markContentPhase();
-            const close = thinkBridge.closeThinkTags(baseChunk);
-            if (close) await writer.write(close);
+          // Hold tool protocol text — OpenCode needs structured tool_calls, not XML dump
+          const markers = ['<tool_call', '<tool_calls', '```tool_call'];
+          if (
+            toolHold ||
+            markers.some((m) => piece.includes(m) || assembled.includes(m))
+          ) {
+            if (!toolHold) {
+              let cut = -1;
+              for (const m of markers) {
+                const i = piece.indexOf(m);
+                if (i >= 0 && (cut < 0 || i < cut)) cut = i;
+              }
+              if (cut > 0) {
+                const prose = piece.slice(0, cut);
+                await emitProgressive(prose, writeContentSlice, {
+                  aborted: () => writer.aborted(),
+                });
+                piece = piece.slice(cut);
+              }
+              toolHold = true;
+            }
+            assembled += piece;
+            return;
           }
+
           // Progressive micro-chunks so OpenCode typewriters instead of dumping a wall
-          await emitProgressive(
-            piece,
-            async (slice) => {
-              if (writer.aborted() || !slice) return;
-              assembled += slice;
-              await writer.write({
-                id,
-                object: 'chat.completion.chunk',
-                created,
-                model: body.model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: slice },
-                    finish_reason: null,
-                    logprobs: null,
-                  },
-                ],
-              });
-            },
-            { aborted: () => writer.aborted() }
-          );
+          await emitProgressive(piece, writeContentSlice, {
+            aborted: () => writer.aborted(),
+          });
         },
         onThought: async (thought) => {
           if (!thought || writer.aborted()) return;

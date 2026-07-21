@@ -119,26 +119,36 @@ export function resolveTaskMode(modelId: string): ManusTaskMode {
 }
 
 /**
- * When the host client (OpenCode/Codex) sends tools, Manus *agent* mode will
- * happily write files under /home/ubuntu on its cloud VM and never emit host
- * tool_calls. Force chat-like modes so the model answers with <tool_call> text
- * that we parse into OpenAI tool_calls for the client.
+ * Manus *agent* mode writes under /home/ubuntu and never emits host tool_calls.
+ * Default for this proxy: always chat (or lite). Agent only if MANUS_ALLOW_AGENT=1.
  *
- * Override with MANUS_FORCE_CHAT_WITH_TOOLS=false to keep agent mode.
+ * MANUS_FORCE_CHAT_WITH_TOOLS=false only matters when MANUS_ALLOW_AGENT=1.
  */
 export function resolveTaskModeForTools(
   modelId: string,
   hasHostTools: boolean
 ): ManusTaskMode {
   const base = resolveTaskMode(modelId);
-  if (!hasHostTools) return base;
-  const force =
-    process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== '0' &&
-    process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== 'false';
-  if (!force) return base;
-  if (base === 'chat' || base === 'lite') return base;
-  // adaptive keeps some planning but still text-first; prefer chat for tools
-  return 'chat';
+  const allowAgent =
+    process.env.MANUS_ALLOW_AGENT === '1' || process.env.MANUS_ALLOW_AGENT === 'true';
+
+  // Default path: never use agent Build for host coding proxies
+  if (!allowAgent) {
+    if (base === 'lite') return 'lite';
+    return 'chat';
+  }
+
+  // Explicit agent allowed — still force chat when host tools present (unless disabled)
+  if (hasHostTools) {
+    const force =
+      process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== '0' &&
+      process.env.MANUS_FORCE_CHAT_WITH_TOOLS !== 'false';
+    if (force) {
+      if (base === 'lite') return 'lite';
+      return 'chat';
+    }
+  }
+  return base;
 }
 
 function pickStringContent(obj: unknown): string {
@@ -209,11 +219,46 @@ function isAssistantChatEvent(event: Record<string, unknown>): boolean {
 /** Content that looks like "I'm about to work" — do not close the turn yet */
 export function looksLikeTurnPreamble(text: string): boolean {
   const t = (text || '').trim();
-  if (!t || t.length > 1200) return false;
+  if (!t) return false;
   if (t.includes('<tool_call') || t.includes('```tool_call')) return false;
-  return /vou (criar|verificar|preparar|escrever|implementar|montar)|deixe-me|com certeza|plano para|let me |i('ll| will) |i'm going to |checking the environment/i.test(
+  // short intros always treated as preamble when tools expected
+  if (t.length < 280) {
+    return /vou |irei |deixe|entendi|com certeza|claro|ok[,!.]|certo|primeiro|ambiente|verificar|prepar|cri(ar|ando)|implement|calculador|arquivo|olhada|looking|let me|i('ll| will)|going to|check(ing)? the|plan|estrutura|padr[oõ]es/i.test(
+      t
+    );
+  }
+  if (t.length > 2000) return false;
+  return /vou (criar|verificar|preparar|escrever|implementar|montar|dar uma)|deixe-me|com certeza|plano para|primeiro[, ]|olhada no|ambiente|let me |i('ll| will) |i'm going to |checking the environment|seguindo os padr/i.test(
     t
   );
+}
+
+/** Host expected tools but model only planned — turn is incomplete */
+export function isIncompleteHostToolTurn(text: string, hasHostTools: boolean): boolean {
+  if (!hasHostTools) return false;
+  const t = (text || '').trim();
+  if (!t) return true;
+  if (hasIncompleteToolMarkup(t)) return true;
+  if (t.includes('<tool_call') || t.includes('```tool_call')) {
+    // has markup that parses — orchestrator handles; allow complete from WS side
+    return false;
+  }
+  // pure Q&A answers (no file work language) can complete without tools
+  const wantsFiles =
+    /cri(ar|e)|escrev|implement|arquivo|file|code|html|calculador|workspace|pasta|projeto|componente|script|\.ts|\.js|\.tsx|\.py|\.css/i.test(
+      t
+    ) || looksLikeTurnPreamble(t);
+  return wantsFiles;
+}
+
+/** Open tool_call tags without matching close — never end the turn yet */
+export function hasIncompleteToolMarkup(text: string): boolean {
+  const s = text || '';
+  const opens = (s.match(/<tool_call[\s>]/gi) || []).length;
+  const closes = (s.match(/<\/tool_call>/gi) || []).length;
+  if (opens > closes) return true;
+  if (/```tool_call/i.test(s) && !/```tool_call[\s\S]*?```/i.test(s)) return true;
+  return false;
 }
 
 /**
@@ -318,19 +363,17 @@ export function detectRequiresInput(
   ev: Record<string, unknown>,
   notification?: Record<string, unknown>
 ): ManusRequiresInput | null {
+  // NOTE: do NOT include bare "pending" — Manus uses it mid-run and false-triggers HITL
   const waitAgent = [
-    'waiting',
-    'paused',
-    'pending',
     'waiting_for_user',
     'wait_for_user',
     'need_user',
     'need_user_input',
     'awaiting_user',
     'awaiting_input',
-    'confirm',
     'user_confirm',
     'idle_waiting',
+    'paused_for_user',
   ];
   const waitSession = [
     'SESSION_STATUS_WAITING',
@@ -369,7 +412,17 @@ export function detectRequiresInput(
   }
 
   if (ev.type === 'statusUpdate' || ev.type === 'queueStatusChange') {
-    if (waitAgent.some((w) => agentStatus.includes(w))) {
+    // Require explicit user-wait tokens — "waiting" alone is too broad (queue waits)
+    const hardWait = [
+      'waiting_for_user',
+      'wait_for_user',
+      'need_user',
+      'awaiting_user',
+      'awaiting_input',
+      'user_confirm',
+      'paused_for_user',
+    ];
+    if (hardWait.some((w) => agentStatus.includes(w))) {
       return {
         prompt: brief || 'Manus pausou e espera sua resposta.',
         reason: 'agent_status_' + agentStatus,
@@ -519,6 +572,9 @@ export async function sendManusChat(opts: {
     let lastEventId: string | null = opts.lastEventId || null;
     let sawAssistantChat = false;
     let agentRunning = false;
+    let lastActivityAt = Date.now();
+    let lastAgentActivityAt = 0;
+    let nudgeCount = 0;
     let turnStatus: ManusTurnStatus = 'completed';
     let requiresInput: ManusRequiresInput | undefined;
     let stopGrace: ReturnType<typeof setTimeout> | null = null;
@@ -531,6 +587,37 @@ export async function sendManusChat(opts: {
         clearTimeout(idleTimer);
         idleTimer = null;
       }
+    };
+
+    const markActivity = (kind: 'text' | 'thought' | 'agent' | 'status' = 'text') => {
+      lastActivityAt = Date.now();
+      if (kind === 'agent' || kind === 'status') lastAgentActivityAt = Date.now();
+    };
+
+    const hasToolMarkup = () =>
+      content.includes('<tool_call') || content.includes('```tool_call');
+
+    /**
+     * HARD GATE: do not end the turn while Manus is mid-work or only sent a plan.
+     * This was the root cause of "Build · Manus · 26s" then silence.
+     */
+    const canComplete = (reason: 'idle' | 'stopped' | 'session_stopped' | 'timeout'): boolean => {
+      if (agentRunning) {
+        console.log(`[manus-ws] block finish (${reason}): agent still running`);
+        return false;
+      }
+      // recent sandbox/tool activity → still working even if status flipped
+      if (Date.now() - lastAgentActivityAt < 8_000) {
+        console.log(`[manus-ws] block finish (${reason}): recent agent activity`);
+        return false;
+      }
+      if (isIncompleteHostToolTurn(content, hasHostTools) && reason !== 'timeout') {
+        console.log(
+          `[manus-ws] block finish (${reason}): incomplete host-tool turn chars=${content.length} nudges=${nudgeCount}`
+        );
+        return false;
+      }
+      return true;
     };
 
     const finish = (err?: Error, status?: ManusTurnStatus) => {
@@ -574,41 +661,110 @@ export async function sendManusChat(opts: {
       }
     };
 
+    /** Push a follow-up user_message in-session so Manus actually emits tool_calls */
+    const sendContinueNudge = (why: string): boolean => {
+      if (settled || !socket?.connected) return false;
+      if (nudgeCount >= 3) return false;
+      if (!hasHostTools && !looksLikeTurnPreamble(content)) return false;
+      nudgeCount += 1;
+      markActivity('text');
+      const nudgeText = [
+        `[HOST NUDGE #${nudgeCount} — ${why}]`,
+        'You already announced the plan. STOP narrating.',
+        'The Manus cloud sandbox is NOT the user machine.',
+        'IMMEDIATELY emit one or more <tool_call>{"name":"...","arguments":{...}}</tool_call> blocks',
+        'using the HOST tools listed in the system protocol (OpenCode/Codex/builtins).',
+        'Do not wait. Do not ask. Do not only describe files — CALL the tools now.',
+        'If the task is pure Q&A with no files, give the final answer in plain text only.',
+      ].join('\n');
+
+      const payload = {
+        id: shortUID(),
+        timestamp: Date.now(),
+        messageStatus: 'pending',
+        type: 'user_message',
+        sessionId,
+        content: '',
+        contents: [{ type: 'text', value: nudgeText }],
+        messageType: 'text',
+        // always chat for host-tool recovery — never re-enter agent Build
+        taskMode: 'chat' as ManusTaskMode,
+        attachments: [] as unknown[],
+        extData: {} as Record<string, unknown>,
+      };
+      console.log(
+        `[manus-ws] continue nudge #${nudgeCount} session=${sessionId} why=${why}`
+      );
+      try {
+        socket.emit('message', payload);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
     /**
-     * Idle-based completion (NOT finish-on-first-chat).
-     * Premature finish was killing the turn after the intro paragraph
-     * while Manus was still working / about to emit tool_calls.
+     * Idle-based completion. Incomplete host-tool turns get NUDGED, not closed.
      */
     const bumpIdle = () => {
       if (settled) return;
       clearIdle();
-      const hasToolMarkup =
-        content.includes('<tool_call') || content.includes('```tool_call');
-      const preamble = looksLikeTurnPreamble(content);
-      // Waiting for host tools after a "vou criar..." intro — stay open longer
-      let idleMs = isChatMode ? 1_800 : 3_500;
-      if (hasHostTools && !hasToolMarkup && (preamble || content.length < 80)) {
-        idleMs = 75_000;
-      } else if (hasHostTools && !hasToolMarkup) {
-        idleMs = 25_000;
-      } else if (agentRunning) {
-        idleMs = 12_000;
-      }
+      markActivity('text');
+
+      let idleMs = isChatMode ? 2_500 : 5_000;
+      if (agentRunning) idleMs = 15_000;
+      else if (isIncompleteHostToolTurn(content, hasHostTools)) idleMs = 20_000;
+      else if (hasToolMarkup()) idleMs = 2_000;
+
       idleTimer = setTimeout(() => {
         if (settled) return;
-        if (content || sawAssistantChat || reasoning) {
+        if (!(content || sawAssistantChat || reasoning)) return;
+
+        if (!canComplete('idle')) {
+          // Root recovery: push Manus to emit tool_calls instead of dying
+          if (isIncompleteHostToolTurn(content, hasHostTools) && nudgeCount < 3) {
+            if (sendContinueNudge('idle_incomplete')) {
+              bumpIdle();
+              return;
+            }
+          }
+          // still blocked (agent running) — keep waiting
+          if (agentRunning || Date.now() - lastAgentActivityAt < 8_000) {
+            bumpIdle();
+            return;
+          }
+          // exhausted nudges — finish with whatever we have
           console.log(
-            `[manus-ws] idle finish session=${sessionId} mode=${taskMode} chars=${content.length} tools=${hasHostTools}`
+            `[manus-ws] idle force-finish after nudges session=${sessionId} chars=${content.length}`
           );
           finish(undefined, 'completed');
+          return;
         }
+
+        console.log(
+          `[manus-ws] idle finish session=${sessionId} mode=${taskMode} chars=${content.length} tools=${hasHostTools} nudges=${nudgeCount}`
+        );
+        finish(undefined, 'completed');
       }, idleMs);
     };
 
-    const scheduleFinish = (ms = 450, status?: ManusTurnStatus) => {
+    const scheduleFinish = (ms = 450, status?: ManusTurnStatus, reason: 'stopped' | 'session_stopped' = 'stopped') => {
       if (stopGrace) clearTimeout(stopGrace);
-      clearIdle();
-      stopGrace = setTimeout(() => finish(undefined, status), ms);
+      stopGrace = setTimeout(() => {
+        if (settled) return;
+        if (!canComplete(reason)) {
+          if (isIncompleteHostToolTurn(content, hasHostTools) && sendContinueNudge(reason)) {
+            bumpIdle();
+            return;
+          }
+          if (agentRunning) {
+            bumpIdle();
+            return;
+          }
+        }
+        clearIdle();
+        finish(undefined, status);
+      }, ms);
     };
 
     const sendStop = () => {
@@ -754,6 +910,7 @@ export async function sendManusChat(opts: {
 
       if (net) {
         sawAssistantChat = true;
+        markActivity('text');
         await opts.handlers?.onDelta?.(net);
         bumpIdle();
       }
@@ -774,6 +931,7 @@ export async function sendManusChat(opts: {
         const { full, net } = mergeThoughtDelta(reasoning, thoughtRaw);
         reasoning = full;
         if (net) {
+          markActivity('thought');
           await opts.handlers?.onThought?.(net);
           bumpIdle();
         }
@@ -782,23 +940,45 @@ export async function sendManusChat(opts: {
       // Agent desktop / sandbox / tools (optional SSE side-channel)
       const agentEv = toAgentEvent(ev);
       if (agentEv) {
+        markActivity('agent');
         await opts.handlers?.onAgentEvent?.(agentEv);
-        if (agentEv.type === 'toolUsed' || agentEv.type === 'liveStatus' || agentEv.type === 'statusUpdate') {
+        if (
+          agentEv.type === 'toolUsed' ||
+          agentEv.type === 'toolUse' ||
+          agentEv.type === 'liveStatus' ||
+          agentEv.type === 'sandboxUpdate' ||
+          agentEv.type === 'statusUpdate'
+        ) {
+          // any build activity keeps the turn alive
+          if (agentEv.status === 'running' || agentEv.agentStatus === 'running') {
+            agentRunning = true;
+          }
           bumpIdle();
         }
       }
 
       if (ev.type === 'statusUpdate') {
-        const st = String(ev.agentStatus || '');
+        const st = String(ev.agentStatus || '').toLowerCase();
         await opts.handlers?.onStatus?.(st, ev);
-        if (st === 'running' || st === 'thinking' || st === 'working') {
+        markActivity('status');
+        if (
+          st === 'running' ||
+          st === 'thinking' ||
+          st === 'working' ||
+          st.includes('run') ||
+          st.includes('think') ||
+          st.includes('work') ||
+          st.includes('build')
+        ) {
           agentRunning = true;
           bumpIdle();
         }
-        if (st === 'stopped') agentRunning = false;
+        if (st === 'stopped' || st === 'done' || st === 'completed' || st === 'idle') {
+          agentRunning = false;
+        }
       }
 
-      // HITL
+      // HITL — only hard user-wait states (pending removed)
       const need = detectRequiresInput(ev);
       if (need) {
         if (!content && need.prompt) {
@@ -821,14 +1001,25 @@ export async function sendManusChat(opts: {
         if (piece) {
           await applyAssistantPiece(piece, !isDelta);
         }
-        // NEVER finish-on-first-chat — that killed progressive tool work.
-        // Idle timer or status=stopped decides.
       }
 
-      if (ev.type === 'statusUpdate' && ev.agentStatus === 'stopped') {
-        // Only hard-finish when we already have content/tools, after a short settle
-        if (sawAssistantChat || content) scheduleFinish(450, 'completed');
-        else if (!agentRunning) scheduleFinish(1_200, 'completed');
+      // status=stopped must NOT kill incomplete host-tool turns (was root bug ~26s)
+      if (ev.type === 'statusUpdate') {
+        const st = String(ev.agentStatus || '').toLowerCase();
+        if (st === 'stopped' || st === 'done' || st === 'completed') {
+          if (canComplete('stopped')) {
+            if (sawAssistantChat || content) scheduleFinish(600, 'completed', 'stopped');
+            else scheduleFinish(1_500, 'completed', 'stopped');
+          } else {
+            console.log(
+              `[manus-ws] ignore early stopped session=${sessionId} incomplete tools turn`
+            );
+            if (isIncompleteHostToolTurn(content, hasHostTools)) {
+              sendContinueNudge('status_stopped_incomplete');
+            }
+            bumpIdle();
+          }
+        }
       }
     };
 
@@ -864,16 +1055,17 @@ export async function sendManusChat(opts: {
       }
     };
 
+    // Serialize handlers — parallel async was racing content/idle/finish
+    let msgChain: Promise<void> = Promise.resolve();
     socket.on('message', (raw: unknown) => {
-      void (async () => {
-        try {
+      msgChain = msgChain
+        .then(async () => {
           events.push(raw);
-          await opts.handlers?.onEvent?.(raw);
           await unwrapAndHandle(raw);
-        } catch (e) {
+        })
+        .catch((e) => {
           console.warn('[manus-ws] message handler error', e);
-        }
-      })();
+        });
     });
 
     socket.on('notification', (raw: unknown) => {
@@ -895,12 +1087,29 @@ export async function sendManusChat(opts: {
           }
 
           if (data?.status === 'SESSION_STATUS_STOPPED') {
-            if (data.lastDisplayMessage && !content) content = data.lastDisplayMessage;
-            scheduleFinish(300, 'completed');
+            if (data.lastDisplayMessage && !content) {
+              content = data.lastDisplayMessage;
+              sawAssistantChat = true;
+            }
+            if (canComplete('session_stopped')) {
+              scheduleFinish(400, 'completed', 'session_stopped');
+            } else {
+              console.log(
+                `[manus-ws] ignore SESSION_STATUS_STOPPED (incomplete) session=${sessionId}`
+              );
+              if (isIncompleteHostToolTurn(content, hasHostTools)) {
+                sendContinueNudge('session_stopped_incomplete');
+              }
+              bumpIdle();
+            }
           }
+          // Only true user-wait session statuses — not generic PENDING mid-run
           if (
             data?.status &&
-            (data.status.includes('WAITING') || data.status.includes('PAUSED'))
+            (data.status.includes('WAITING_FOR_USER') ||
+              data.status.includes('NEED_USER') ||
+              data.status.includes('AWAITING_USER') ||
+              data.status === 'SESSION_STATUS_PAUSED')
           ) {
             await handleRequiresInput({
               prompt: data.lastDisplayMessage || 'Aguardando sua resposta.',

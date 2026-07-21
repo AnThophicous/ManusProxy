@@ -19,6 +19,7 @@ CRITICAL — USER MACHINE vs MANUS SANDBOX:
 - Files written only there never reach OpenCode/Codex/the user. That is a failed delivery.
 - When tools are listed in the prompt, create/edit/read files ONLY by emitting <tool_call> blocks for those tools.
 - Do not claim "arquivo criado em /home/ubuntu/..." as success. Emit the tool_call instead.
+- Never end a coding turn with only a promise ("vou criar", "vou verificar o ambiente"). Emit tools or the final answer.
 [/SYSTEM]`;
 
 /** Prepend autonomy rules to any outbound user/task prompt */
